@@ -852,18 +852,21 @@ fn random_keys_and_resizes_never_panic() {
 }
 
 /// Content that passes validation but pushes every limit: CJK in every field, combining-mark
-/// stacks at the cap, 2,048-character URLs, 64-entry lists, a one-span intro, and a thought
-/// with no sections.
+/// stacks at the cap, emoji clusters at the code-point and ZWJ caps, skin tones, 2,048-character
+/// URLs, 64-entry lists, a one-span intro, and a thought with no sections.
 /// List bodies are full length only for the first entry, which keeps a debug run near a second.
 fn adversarial_content() -> Portfolio {
     use crate::content::{
-        MAX_COMBINING_MARKS, MAX_LIST_ENTRIES, Project, Span, SpanStyle, Thought, ThoughtItem,
-        ThoughtSection, Webring, Work,
+        MAX_CLUSTER_CHARS, MAX_COMBINING_MARKS, MAX_LIST_ENTRIES, Project, Span, SpanStyle,
+        Thought, ThoughtItem, ThoughtSection, Webring, Work,
     };
     let stack = format!("e{}", "\u{301}".repeat(MAX_COMBINING_MARKS));
-    // `chars` characters of CJK, Hangul, wide punctuation and capped stacks.
+    // Three ZWJs and two skin tones (10 code points), padded with VS16 to the cluster cap.
+    let kiss = "👩🏻\u{200d}\u{2764}\u{fe0f}\u{200d}💋\u{200d}👨🏼";
+    let chain = format!("{kiss}{}", "\u{fe0f}".repeat(MAX_CLUSTER_CHARS - 10));
+    // `chars` characters of CJK, Hangul, wide punctuation, capped stacks and emoji clusters.
     let text = |chars: usize| -> String {
-        let unit = format!("漢字テスト、한국어{stack}（全角） ");
+        let unit = format!("漢字テスト、한국어{stack}（全角）{chain}👋🏽 ");
         unit.chars().cycle().take(chars).collect()
     };
     let body = |index: usize| if index == 0 { 2048 } else { 160 };
@@ -1000,6 +1003,12 @@ fn adversarial_content_at_odd_sizes_never_panics_or_leaks_control_bytes() {
                     .iter()
                     .all(|cell| !cell.symbol().contains(char::is_control)),
                 "{context}: control character in a cell"
+            );
+            assert!(
+                frame.buffer.content.iter().all(|cell| {
+                    cell.symbol().chars().count() <= crate::content::MAX_CLUSTER_CHARS
+                }),
+                "{context}: oversized cell"
             );
             assert!(app.scroll <= app.max_scroll, "{context}");
             links += assert_well_formed_escapes(&link_escapes(&app));

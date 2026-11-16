@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/aidanjnn/personal-portfolio-ssh/main/content/portfolio.schema.json",
-  "$comment": "Portfolio content contract v2. Produced by the Next.js site at /portfolio.json and consumed by the SSH portfolio. Nullable fields must still be present. The Rust loader additionally limits snapshots to 1 MiB; rejects control (Cc), format (Cf), private-use (Co), surrogate, unassigned and noncharacter code points, line and paragraph separators, Hangul fillers, and U+200D outside emoji ZWJ sequences; rejects more than 8 consecutive combining marks; and requires text to contain a visible glyph.",
+  "$comment": "Portfolio content contract v2. Produced by the Next.js site at /portfolio.json and consumed by the SSH portfolio. Nullable fields must still be present. The Rust loader additionally limits snapshots to 1 MiB; rejects control (Cc), format (Cf), private-use (Co), surrogate, unassigned and noncharacter code points, line and paragraph separators, Hangul fillers, U+200D outside emoji ZWJ sequences, and skin-tone modifiers not directly after an emoji modifier base; rejects more than 8 consecutive combining marks, and grapheme clusters of more than 16 code points or 3 ZWJs; and requires text to contain a visible glyph.",
   "title": "Aidan Jeon public portfolio",
   "type": "object",
   "additionalProperties": false,

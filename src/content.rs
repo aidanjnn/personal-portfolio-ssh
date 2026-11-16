@@ -2,8 +2,9 @@ use std::{error::Error, fmt, ops::Deref};
 
 use serde::{Deserialize, Serialize};
 use unicode_properties::{
-    GeneralCategory, GeneralCategoryGroup, UnicodeEmoji, UnicodeGeneralCategory,
+    EmojiStatus, GeneralCategory, GeneralCategoryGroup, UnicodeEmoji, UnicodeGeneralCategory,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 pub const BUNDLED_JSON: &str = include_str!("../content/portfolio.json");
@@ -329,6 +330,12 @@ fn validate_text(field: &str, text: &str, maximum: usize) -> Result<(), ContentE
 const ZWJ: char = '\u{200d}';
 const VS16: char = '\u{fe0f}';
 pub const MAX_COMBINING_MARKS: usize = 8;
+/// A grapheme cluster is drawn in one terminal cell (or two), however many code points it
+/// holds. The longest standard emoji (👩🏻‍❤️‍💋‍👨🏼, kiss with two skin tones) is 10 code points
+/// with 3 joiners, so these caps admit every standard emoji and keep a cell's symbol small.
+pub const MAX_CLUSTER_CHARS: usize = 16;
+pub const MAX_CLUSTER_JOINERS: usize = 3;
+const SKIN_TONES: std::ops::RangeInclusive<char> = '\u{1f3fb}'..='\u{1f3ff}';
 /// Hangul fillers are letters (Lo) that draw nothing, so no category rule catches them.
 const HANGUL_FILLERS: [char; 4] = ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'];
 
@@ -356,21 +363,37 @@ fn is_emoji(ch: char) -> bool {
     !ch.is_ascii() && ch.is_emoji_char()
 }
 
+/// Emoji_Modifier_Base: the emoji a skin-tone modifier may follow (👋, 👩, ✍).
+fn is_modifier_base(ch: char) -> bool {
+    matches!(
+        ch.emoji_status(),
+        EmojiStatus::EmojiModifierBase | EmojiStatus::EmojiPresentationAndModifierBase
+    )
+}
+
 /// Rejects characters that could drive the terminal or hide text. The one Cf character kept is
 /// U+200D ZERO WIDTH JOINER, and only inside an emoji ZWJ sequence (👩‍💻, ❤️‍🔥): right after an
 /// emoji (optionally with VS16) and right before another. Those sequences are common in written
 /// text and render as one glyph; anywhere else a ZWJ is just an invisible character.
 ///
+/// A skin-tone modifier (U+1F3FB–U+1F3FF) is kept only right after an emoji modifier base,
+/// so it can appear once per base (👋🏽) and never repeat (👋🏽🏽 would widen one cell).
+///
 /// It also caps consecutive combining marks (Mn, Mc, Me) at `MAX_COMBINING_MARKS`: real text
 /// stacks a few at most, while "zalgo" stacks draw far outside their cell and make one
-/// terminal cell carry an unbounded symbol.
+/// terminal cell carry an unbounded symbol. Every grapheme cluster is capped at
+/// `MAX_CLUSTER_CHARS` code points and `MAX_CLUSTER_JOINERS` ZWJs for the same reason: an emoji
+/// ZWJ chain of any length is one cluster, and so one cell.
 fn reject_unsafe_chars(field: &str, text: &str) -> Result<(), ContentError> {
     let mut after_emoji = false;
+    let mut previous = None;
     let mut marks = 0;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         let safe = if ch == ZWJ {
             after_emoji && chars.peek().is_some_and(|&next| is_emoji(next))
+        } else if SKIN_TONES.contains(&ch) {
+            previous.is_some_and(is_modifier_base)
         } else {
             !is_unsafe_char(ch)
         };
@@ -380,6 +403,7 @@ fn reject_unsafe_chars(field: &str, text: &str) -> Result<(), ContentError> {
                 u32::from(ch)
             )));
         }
+        previous = Some(ch);
         after_emoji = is_emoji(ch) || (after_emoji && ch == VS16);
         marks = match ch.general_category_group() {
             GeneralCategoryGroup::Mark => marks + 1,
@@ -388,6 +412,15 @@ fn reject_unsafe_chars(field: &str, text: &str) -> Result<(), ContentError> {
         if marks > MAX_COMBINING_MARKS {
             return Err(ContentError(format!(
                 "{field} stacks more than {MAX_COMBINING_MARKS} combining marks on one character"
+            )));
+        }
+    }
+    for cluster in text.graphemes(true) {
+        let joiners = cluster.chars().filter(|&ch| ch == ZWJ).count();
+        if cluster.chars().count() > MAX_CLUSTER_CHARS || joiners > MAX_CLUSTER_JOINERS {
+            return Err(ContentError(format!(
+                "{field} joins more than {MAX_CLUSTER_CHARS} code points or \
+                 {MAX_CLUSTER_JOINERS} ZWJs into one character"
             )));
         }
     }
@@ -602,6 +635,51 @@ mod tests {
         let mut content = bundled_data();
         content.projects[0].title = stack(64);
         assert!(content.validate().is_err());
+    }
+
+    #[test]
+    fn caps_grapheme_clusters() {
+        // The longest standard emoji: 10 code points, 3 ZWJs, two skin tones.
+        let kiss = "👩🏻\u{200d}\u{2764}\u{fe0f}\u{200d}💋\u{200d}👨🏼";
+        let at_cap = format!("{kiss}{}", "\u{fe0f}".repeat(MAX_CLUSTER_CHARS - 10));
+        for text in [
+            kiss,
+            &at_cap,
+            "👨\u{200d}👩\u{200d}👧\u{200d}👦",
+            "👋🏽 hi",
+            "✍🏿",
+            "\u{1100}\u{1161}\u{11a8}",
+        ] {
+            assert!(validate_text("t", text, 128).is_ok(), "rejected {text:?}");
+        }
+        let chain = |count: usize, emoji: &str| vec![emoji; count].join("\u{200d}");
+        for text in [
+            // One joiner too many, and the reviewer's chains (128 characters of each).
+            chain(MAX_CLUSTER_JOINERS + 2, "👩"),
+            format!("A{}", chain(300, "👩")),
+            format!("C©{}", "\u{200d}©".repeat(300)),
+            // One code point too many: VS16 keeps the joiner legal but grows the cluster.
+            format!("{at_cap}\u{fe0f}"),
+            format!("👩{0}\u{200d}👩{0}", "\u{fe0f}".repeat(8)),
+            // Conjoining jamo never break, so 17 leading consonants are one cluster.
+            format!("{}\u{1161}", "\u{1100}".repeat(16)),
+            // A skin tone only directly after a modifier base, and once.
+            format!("B👋{}", "🏽".repeat(300)),
+            "👋🏽🏽".into(),
+            "a🏽".into(),
+            "🏽".into(),
+            "☕🏽".into(),
+            "👩\u{200d}🏽".into(),
+        ] {
+            let short: String = text.chars().take(SHORT_TEXT_LIMIT).collect();
+            assert!(
+                validate_text("t", &short, 128).is_err(),
+                "accepted {short:?}"
+            );
+            let mut content = bundled_data();
+            content.projects[0].title = short;
+            assert!(content.validate().is_err(), "accepted {text:?}");
+        }
     }
 
     #[test]
