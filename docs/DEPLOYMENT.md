@@ -143,13 +143,15 @@ Pass `--location <region>` to force one.
    ```sh
    deploy/azure.sh --dry-run
    ```
-4. **Provision.** Read the key without echoing it, then run:
+4. **Provision.** Read the key without echoing it, so it never lands in your shell history, then run (bash or zsh):
    ```sh
-   read -rs TS_AUTHKEY && export TS_AUTHKEY
-   TAG=<tag> deploy/azure.sh --ssh-key ~/.ssh/id_ed25519.pub
+   printf 'Tailscale auth key: '; read -rs TS_AUTHKEY; echo
+   TS_AUTHKEY=$TS_AUTHKEY TAG=<tag> deploy/azure.sh --ssh-key ~/.ssh/id_ed25519.pub
    unset TS_AUTHKEY
    ```
    It takes about 10 minutes and prints the public IPv4 last. Without `TAG` it starts `:latest`.
+
+   > **Never** run `azure.sh` with `bash -x`, or add `az --debug` to its commands. Both print the run-command script, auth key included, to your terminal.
 
 What `azure.sh` does, in order:
 
@@ -159,7 +161,7 @@ What `azure.sh` does, in order:
 4. Sends `deploy/` to the VM inside one `az vm run-command invoke` script and runs `bootstrap.sh` as root. Bootstrap installs Docker (pinning `daemon.json`) and Tailscale, adds the rate limit, joins the tailnet with `tailscale up --ssh`, masks `ssh.socket` and `ssh.service`, adds a 1 GiB swap file, creates the `deploy` user, installs `/opt/portfolio`, pulls the image and starts the stack. It waits for the portfolio's health check and prints the fingerprint, then `BOOTSTRAP_OK`.
 5. Only on `BOOTSTRAP_OK`, adds the NSG rule for TCP 22, 2222, 80 and 443.
 
-The auth key never appears in output or in the repo. It travels in the run-command script, from a mode-0600 temp file that is deleted on exit. The Azure agent keeps a root-only copy of that script on the VM, which is why the key must be one-off.
+The auth key never appears in output, in the repo or on a command line. It travels in the run-command script, from a mode-0600 temp file on your laptop that is deleted on exit. On the VM the script writes it to a mode-0600 file in a private temp dir, and `bootstrap.sh` unsets every key variable before apt or dpkg runs, passes the file with `tailscale up --auth-key=file:PATH` (Tailscale 1.22 or later; bootstrap checks) and deletes it. The Azure agent keeps a root-only copy of the script on the VM, which is why the key must be one-off.
 
 **Re-running.** `azure.sh` is idempotent. Re-run it after changing anything in `deploy/`; CI does not sync those files. A re-run keeps the running release unless you set `TAG`, and needs no auth key once the VM is on the tailnet.
 
@@ -179,7 +181,7 @@ The first command must reach the host shell over Tailscale (not the portfolio), 
 
 To keep the published fingerprint on a new VM, restore the key before the stack ever starts:
 
-1. `TS_AUTHKEY=... deploy/azure.sh --no-start`. Bootstrap installs everything but leaves the stack stopped and the NSG closed.
+1. Read a fresh auth key as in [Provision](#provision) step 4, then `TS_AUTHKEY=$TS_AUTHKEY deploy/azure.sh --no-start`. Bootstrap installs everything but leaves the stack stopped and the NSG closed.
 2. Restore the key ([below](#host-key-backup-and-restore)).
 3. `deploy/azure.sh` again. It starts the stack and opens the NSG. Check that `fingerprint.sh` prints the published value.
 

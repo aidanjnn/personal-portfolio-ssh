@@ -5,11 +5,16 @@
 # other deploy/ files next to it. There is no public admin SSH at any point.
 # By hand, as root on the VM, with the whole deploy/ directory:
 #
-#   TS_AUTHKEY=tskey-auth-... bash deploy/bootstrap.sh
+#   read -rs TS_AUTHKEY && TS_AUTHKEY=$TS_AUTHKEY bash deploy/bootstrap.sh
+#
+# Never run it with `bash -x`: the trace would print the auth key.
 #
 # Environment:
-#   TS_AUTHKEY   One-off Tailscale auth key. Needed only until the VM has
-#                joined the tailnet. Never printed or written to disk here.
+#   TS_AUTHKEY_FILE  File holding a one-off Tailscale auth key (azure.sh's
+#                    payload writes one, mode 0600). Deleted once read.
+#   TS_AUTHKEY   Alternative for runs by hand: the key itself. It is moved to
+#                a mode-0600 temp file and unset before anything else runs.
+#                Either is needed only until the VM has joined the tailnet.
 #   TS_HOSTNAME  Tailnet name (default portfolio).
 #   TS_TAGS      Tags to advertise (default tag:portfolio).
 #   TAG          Image tag (default: the tag already running, else latest).
@@ -65,6 +70,19 @@ install_file() { put "$1" "$3" <"$2"; } # mode src dst
 # --- Preflight ----------------------------------------------------------------
 
 [[ ${EUID} -eq 0 ]] || die "run as root"
+
+# Take the Tailscale auth key out of the environment before anything else runs:
+# apt, dpkg and their maintainer scripts inherit it. tailscale up reads it from
+# a mode-0600 file (--auth-key=file:PATH), so it never appears in a process's
+# arguments either. The file is deleted on exit.
+ts_key_file=${TS_AUTHKEY_FILE:-}
+if [[ -z ${ts_key_file} && -n ${TS_AUTHKEY:-} ]]; then
+  ts_key_file=$(mktemp) # mode 0600
+  printf '%s\n' "${TS_AUTHKEY}" >"${ts_key_file}" # printf is a builtin: no argv
+fi
+unset TS_AUTHKEY TS_AUTHKEY_FILE
+cleanup() { [[ -z ${ts_key_file} ]] || rm -f -- "${ts_key_file}"; }
+trap cleanup EXIT
 [[ ${START_STACK} == 0 || ${START_STACK} == 1 ]] || die "START_STACK must be 0 or 1"
 
 # shellcheck source=/dev/null
@@ -198,6 +216,14 @@ systemctl restart portfolio-ratelimit.service
 # answers port 22 on the tailnet address itself, so it never reaches the
 # portfolio container that owns port 22 on the public address.
 
+# --auth-key=file:PATH needs Tailscale 1.22 or later. The stable repository
+# always serves a current release, so this only catches a held old package.
+readonly MIN_TAILSCALE=1.22.0
+ts_version=$(tailscale version)
+ts_version=${ts_version%%$'\n'*}
+dpkg --compare-versions "${ts_version}" ge "${MIN_TAILSCALE}" \
+  || die "Tailscale ${ts_version} is older than ${MIN_TAILSCALE}"
+
 # Captured, not piped into grep -q, which can SIGPIPE the writer under pipefail.
 ts_status=$(tailscale status --json --peers=false 2>/dev/null || true)
 if [[ ${ts_status} =~ \"BackendState\":\ *\"Running\" ]]; then
@@ -205,11 +231,12 @@ if [[ ${ts_status} =~ \"BackendState\":\ *\"Running\" ]]; then
   tailscale set --ssh --hostname="${TS_HOSTNAME}"
 else
   log "Joining the tailnet as ${TS_HOSTNAME}"
-  [[ -n ${TS_AUTHKEY:-} ]] || die "TS_AUTHKEY is required to join the tailnet"
-  tailscale up --auth-key="${TS_AUTHKEY}" --ssh --hostname="${TS_HOSTNAME}" \
+  [[ -n ${ts_key_file} && -s ${ts_key_file} ]] || die "TS_AUTHKEY is required to join the tailnet"
+  # file: needs Tailscale 1.22 or later (checked above).
+  tailscale up --auth-key="file:${ts_key_file}" --ssh --hostname="${TS_HOSTNAME}" \
     --advertise-tags="${TS_TAGS}" --timeout=120s
 fi
-unset TS_AUTHKEY
+cleanup
 TS_IP=$(tailscale ip -4 | head -n 1)
 [[ ${TS_IP} == 100.* ]] || die "no tailnet IPv4 address"
 ts_prefs=$(tailscale debug prefs 2>/dev/null || true)

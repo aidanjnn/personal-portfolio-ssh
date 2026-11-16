@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Provision the portfolio VM on Azure (Azure for Students) and bootstrap it.
 #
-#   TS_AUTHKEY=tskey-auth-... deploy/azure.sh --ssh-key ~/.ssh/id_ed25519.pub
+#   printf 'Tailscale auth key: '; read -rs TS_AUTHKEY; echo
+#   TS_AUTHKEY=$TS_AUTHKEY deploy/azure.sh --ssh-key ~/.ssh/id_ed25519.pub
+#   unset TS_AUTHKEY
 #   deploy/azure.sh --dry-run     # print the az commands; needs no az, login or key
+#
+# Never run it with `bash -x` or `az --debug`: both print the run-command
+# script, which carries the auth key.
 #
 # Creates resource group `portfolio` with a VNet, an NSG with no inbound allow
 # rules, a Standard static IPv4 and a Standard_B2ats_v2 Ubuntu 24.04 VM with
@@ -56,7 +61,10 @@ Options:
 Environment:
   TS_AUTHKEY  One-off Tailscale auth key tagged tag:portfolio. Needed until the
               VM has joined the tailnet. Never printed; it reaches the VM only
-              inside the run-command script.
+              inside the run-command script, which writes it to a mode-0600
+              file for `tailscale up --auth-key=file:PATH`. Read it with
+              `read -rs` so it stays out of shell history, and never use
+              `bash -x` or `az --debug`, which would print it.
   TAG         Image tag to start (default: the tag already running, else latest).
 EOF
 }
@@ -251,7 +259,14 @@ EOF
     base64 <"${DEPLOY_DIR}/${f}" | tr -d '\n'
     printf '\nB64\n'
   done
-  [[ -z $1 ]] || printf "export TS_AUTHKEY='%s'\n" "$1"
+  # The key goes into a file in the private dir (umask 077, so mode 0600) via a
+  # heredoc, never into the environment or a command line. The EXIT trap
+  # deletes it, and bootstrap deletes it once tailscale up has read it.
+  if [[ -n $1 ]]; then
+    printf "cat > \"\$dir/ts-authkey\" <<'KEY'\n%s\nKEY\n" "$1"
+    # shellcheck disable=SC2016 # $dir expands on the VM
+    printf 'export TS_AUTHKEY_FILE="$dir/ts-authkey"\n'
+  fi
   [[ -z ${TAG:-} ]] || printf "export TAG='%s'\n" "${TAG}"
   printf "export START_STACK='%s'\n" "${start_stack}"
   # shellcheck disable=SC2016 # $dir expands on the VM
