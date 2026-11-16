@@ -334,6 +334,7 @@ log "Installing the stack into ${APP_DIR}"
 install -d -m 0755 "${APP_DIR}"
 install_file 0644 "${SCRIPT_DIR}/compose.prod.yaml" "${APP_DIR}/compose.prod.yaml"
 install_file 0644 "${SCRIPT_DIR}/Caddyfile" "${APP_DIR}/Caddyfile"
+caddyfile_changed=${changed}
 install_file 0755 "${SCRIPT_DIR}/fingerprint.sh" "${APP_DIR}/fingerprint.sh"
 compose config --quiet
 
@@ -366,11 +367,23 @@ if [[ ${START_STACK} == 1 ]]; then
   log "Starting ${PORTFOLIO_IMAGE}"
   compose pull --quiet
   # --wait returns once portfolio is healthy (its SSH health check) and caddy runs.
+  # Caddy does not watch its file, and `up` does not recreate a container for a
+  # changed bind-mounted file. install also replaces the file (a new inode), so
+  # a running container would keep reading the old one even after a reload.
+  # Recreate caddy when its file changed and it was already there.
+  caddy_existed=$(compose ps -a -q caddy 2>/dev/null || true)
   compose up -d --remove-orphans --wait --wait-timeout 180
+  if [[ ${caddyfile_changed} == 1 && -n ${caddy_existed} ]]; then
+    log "Caddyfile changed: recreating caddy"
+    compose up -d --no-deps --force-recreate --wait --wait-timeout 60 caddy
+  fi
   fingerprint=$("${APP_DIR}/fingerprint.sh" | awk '/\(ED25519\)/ {print $1}')
   stack=started
 elif [[ -n $(compose ps -q 2>/dev/null || true) ]]; then
   log "START_STACK=0: not starting anything; the stack was already running and stays up"
+  if [[ ${caddyfile_changed} == 1 ]]; then
+    log "The new Caddyfile takes effect when caddy is recreated (re-run with START_STACK=1)"
+  fi
   stack=held
 else
   log "START_STACK=0: leaving the stack stopped"

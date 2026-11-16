@@ -349,7 +349,8 @@ The key is `/data/ssh_host_ed25519_key` in volume `portfolio_host-key`, owned by
 **Backup**, from your laptop over Tailscale. This works whether or not the service is running:
 
 ```sh
-ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml run --rm --no-deps -T --entrypoint tar portfolio -C /data -cf - .' > portfolio-host-key.tar
+# umask 077 in a subshell: the tar holds the private key, so only you may read it.
+(umask 077 && ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml run --rm --no-deps -T --entrypoint tar portfolio -C /data -cf - .' > portfolio-host-key.tar)
 
 # Check it: ssh-keygen refuses keys read from a pipe, so extract privately.
 mkdir -m 700 host-key-check && tar -xf portfolio-host-key.tar -C host-key-check
