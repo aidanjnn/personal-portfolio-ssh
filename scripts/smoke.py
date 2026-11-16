@@ -156,6 +156,7 @@ NIGHT_CANVAS = b"48;2;17;22;27"
 GOODBYE = b"thanks for stopping by"
 TIME_LIMIT = b"session time limit reached"
 RESTARTING = b"the portfolio is restarting"
+BUSY = "aidanjeon.com is busy; try again in a minute"
 HOME = "University of Waterloo"
 COPPERLANE_URL = "https://www.copperlane.ai/"
 OTTO_URL = "https://github.com/abrj7/otto"
@@ -551,6 +552,7 @@ def check_ssh(binary, output, port, slow=False):
             terminal.capture("refused")
             assert status != 0, f"{why}: visitor was not refused"
             assert HOME not in terminal.screen.text(), f"{why}: refused visitor saw the portfolio"
+            assert BUSY.encode() in terminal.wire, f"{why}: refused visitor was not told why"
 
         options = ["ssh", "-F", "/dev/null", "-p", str(port), "-o", "BatchMode=yes",
                    "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known}",
@@ -585,7 +587,7 @@ def check_ssh(binary, output, port, slow=False):
             # The cap is per address: two localhost visitors are active now.
             refused = session("ssh-per-ip-refused")
             assert_refused(refused, "--max-per-ip 2")
-            checks.ok("third concurrent localhost visitor refused by --max-per-ip 2")
+            checks.ok("third concurrent localhost visitor refused by --max-per-ip 2 and told the server is busy")
             if address_available("127.0.0.2"):
                 other = session("ssh-per-ip-other-address", extra=["-b", "127.0.0.2"])
                 other.wait_for(HOME)
@@ -713,7 +715,7 @@ def check_ssh(binary, output, port, slow=False):
             recovered.wait_for(HOME)
             recovered.quit()
             wait_idle()
-            checks.ok("--max-sessions 1 refuses a second visitor, then frees the slot")
+            checks.ok("--max-sessions 1 refuses a second visitor with the busy message, then frees the slot")
 
             if slow:
                 stop(server)
@@ -749,6 +751,23 @@ def check_ssh(binary, output, port, slow=False):
             wait_idle()
             assert "reason idle" in server_log(), "idle disconnect not logged with its reason"
             checks.ok("idle timeout restores the terminal and logs reason idle")
+
+            # Last, since it spends this address's connection budget for minutes.
+            replies = []
+            for _ in range(30):
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
+                    try:
+                        replies.append(raw.recv(256))
+                    except OSError:
+                        replies.append(b"")
+            admitted = sum(reply.startswith(b"SSH-2.0-") for reply in replies)
+            told = sum(reply.startswith(BUSY.encode()) for reply in replies)
+            assert 0 < admitted <= 20, f"{admitted} of 30 rapid connections admitted"
+            assert admitted + told == len(replies), "a rate-limited client was not told why"
+            stop(server)
+            server = None
+            assert f"(rate {told}," in server_log(), "rate refusals missing from the summary"
+            checks.ok(f"rapid reconnects: {admitted} admitted, {told} refused with the busy message")
 
             text = server_log()
             assert "session connect" in text and "session disconnect" in text, "session lifecycle not logged"

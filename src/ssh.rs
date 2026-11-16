@@ -131,6 +131,8 @@ async fn run_server(
     let mut gate = Gate::new(config.max_per_ip, config.max_sessions, Instant::now());
     let log = Arc::new(Log::new(Instant::now()));
     let mut summaries = tokio::time::interval(SUMMARY_INTERVAL);
+    let busy: Arc<[u8]> = busy_reply(&ssh_config.server_id).into();
+    let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
     let (shutdown, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
     tokio::pin!(stop);
@@ -150,6 +152,14 @@ async fn run_server(
                     Ok(admission) => admission,
                     Err(refusal) => {
                         log.refused(refusal);
+                        // Bounded, so a flood of refusals is closed rather than answered.
+                        if let Ok(permit) = Arc::clone(&refusing).try_acquire_owned() {
+                            let busy = Arc::clone(&busy);
+                            tokio::spawn(async move {
+                                refuse(stream, &busy).await;
+                                drop(permit);
+                            });
+                        }
                         continue;
                     }
                 };
@@ -518,6 +528,54 @@ impl ConnectionRate {
         });
         self.pruned = now;
     }
+}
+
+const BUSY_MESSAGE: &str = "aidanjeon.com is busy; try again in a minute";
+/// Refused connections being told why at once; past this, they are simply closed.
+const MAX_REFUSING: usize = 64;
+/// How long a refused connection may take to read its reply and hang up.
+const REFUSAL_LINGER: Duration = Duration::from_secs(1);
+
+/// The whole reply to a refused client, sent instead of starting SSH. First the reason as a
+/// plain line, which RFC 4253 section 4.2 lets a server send before its version and which
+/// raw TCP clients show; then the version line and an unencrypted SSH_MSG_DISCONNECT, which
+/// OpenSSH prints even at LogLevel=ERROR: "Received disconnect from …: <reason>".
+fn busy_reply(server_id: &russh::SshId) -> Vec<u8> {
+    const SSH_MSG_DISCONNECT: u8 = 1;
+    const SSH_DISCONNECT_TOO_MANY_CONNECTIONS: u32 = 12;
+    let mut payload = vec![SSH_MSG_DISCONNECT];
+    payload.extend_from_slice(&SSH_DISCONNECT_TOO_MANY_CONNECTIONS.to_be_bytes());
+    payload.extend_from_slice(&(BUSY_MESSAGE.len() as u32).to_be_bytes());
+    payload.extend_from_slice(BUSY_MESSAGE.as_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes()); // An empty language tag.
+    // RFC 4253 section 6: length, padding length, payload and at least 4 bytes of padding,
+    // in all a multiple of 8 when there is no cipher yet.
+    let padding = 4 + (8 - (5 + payload.len() + 4) % 8) % 8;
+    let version = match server_id {
+        russh::SshId::Standard(id) => format!("{id}\r\n"),
+        russh::SshId::Raw(id) => id.to_string(),
+    };
+    let mut reply = format!("{BUSY_MESSAGE}\r\n{version}").into_bytes();
+    reply.extend_from_slice(&((1 + payload.len() + padding) as u32).to_be_bytes());
+    reply.push(padding as u8);
+    reply.extend_from_slice(&payload);
+    reply.resize(reply.len() + padding, 0);
+    reply
+}
+
+/// Sends a refused client `reply`, then closes once it hangs up (at most `REFUSAL_LINGER`):
+/// closing with its own bytes unread would reset the connection, which can discard the
+/// reply before the client reads it.
+async fn refuse(mut stream: TcpStream, reply: &[u8]) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = timeout(REFUSAL_LINGER, async {
+        stream.write_all(reply).await?;
+        stream.shutdown().await?;
+        let mut sink = [0; 1024];
+        while stream.read(&mut sink).await? > 0 {}
+        io::Result::Ok(())
+    })
+    .await;
 }
 
 /// Why a connection was refused.
@@ -1844,7 +1902,7 @@ mod tests {
             ..test_config()
         })
         .await;
-        let mut admitted = 0;
+        let (mut admitted, mut told) = (0, 0);
         for _ in 0..30 {
             let mut stream = TcpStream::connect(server.addr).await.unwrap();
             let mut first = Vec::new();
@@ -1855,9 +1913,65 @@ mod tests {
             .await;
             if first.starts_with(b"SSH-2.0-") {
                 admitted += 1;
+            } else if first.starts_with(BUSY_MESSAGE.as_bytes()) {
+                told += 1;
             }
         }
         assert_eq!(admitted, CONNECTION_BURST as usize);
+        assert_eq!(told, 30 - admitted, "refused clients must be told why");
+        server.stop().await;
+    }
+
+    #[test]
+    fn the_busy_reply_is_a_plain_line_then_a_valid_ssh_disconnect() {
+        let id = russh::SshId::Standard("SSH-2.0-test".into());
+        let reply = busy_reply(&id);
+        let rest = reply
+            .strip_prefix(format!("{BUSY_MESSAGE}\r\nSSH-2.0-test\r\n").as_bytes())
+            .unwrap();
+        let length = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+        assert_eq!(rest.len(), 4 + length);
+        assert_eq!(
+            rest.len() % 8,
+            0,
+            "unencrypted packets are a multiple of 8 bytes"
+        );
+        let padding = usize::from(rest[4]);
+        assert!(padding >= 4);
+        let payload = &rest[5..rest.len() - padding];
+        assert_eq!(payload[0], 1, "SSH_MSG_DISCONNECT");
+        assert_eq!(payload[1..5], 12u32.to_be_bytes());
+        let text = u32::from_be_bytes(payload[5..9].try_into().unwrap()) as usize;
+        assert_eq!(&payload[9..9 + text], BUSY_MESSAGE.as_bytes());
+        assert_eq!(&payload[9 + text..], [0; 4], "empty language tag");
+    }
+
+    #[tokio::test]
+    async fn a_visitor_refused_for_capacity_is_told_why() {
+        let server = TestServer::start(Config {
+            max_sessions: 1,
+            ..test_config()
+        })
+        .await;
+        let mut holder = Visit::open(server.addr, true).await;
+        holder.read_until(ENTER).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        let mut reply = Vec::new();
+        timeout(
+            Duration::from_secs(3),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut reply),
+        )
+        .await
+        .expect("the refused connection was not closed")
+        .unwrap();
+        assert_eq!(reply, busy_reply(&test_ssh_config().server_id));
+        // An SSH client is refused before any key exchange.
+        let config = Arc::new(russh::client::Config::default());
+        assert!(
+            russh::client::connect(config, server.addr, TestClient)
+                .await
+                .is_err()
+        );
         server.stop().await;
     }
 
