@@ -1,6 +1,6 @@
 # Portfolio content
 
-The website is the source of truth. Its build serves `https://www.aidanjeon.com/portfolio.json`, generated from its own `content/*.ts`. The SSH server bundles a snapshot of that file (`content/portfolio.json`) and, when started with `--content-url`, refreshes it from the website: at most once a minute, with a 2 s timeout, keeping the last good copy. A visitor never waits on the network. Each session keeps the snapshot it started with.
+The website is the source of truth. Its build serves `https://www.aidanjeon.com/portfolio.json`, generated from its own `content/*.ts`. The SSH server bundles a snapshot of that file (`content/portfolio.json`) and, when started with `--content-url`, refreshes it from the website in the background: once at startup and then once a minute, with a 2 s timeout, keeping the last good copy. A fetch still running when the next minute comes skips that tick rather than starting a second one. A visitor never waits on the network. Each session keeps the snapshot it started with.
 
 To change copy, edit the website. Its CI validates the `/portfolio.json` it is about to deploy with this server's own validator (`--check-content`, run from the published image), so a content edit the server would reject fails the website's build instead of silently freezing the SSH portfolio on its last good copy.
 

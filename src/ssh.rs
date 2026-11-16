@@ -42,6 +42,8 @@ const DEADLINE_GRACE: Duration = Duration::from_secs(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// How long a client gets to hang up by itself after its channel closes.
 const HANGUP_GRACE: Duration = Duration::from_secs(1);
+/// How long a stopping server waits for the content refresher task to end.
+const REFRESHER_GRACE: Duration = Duration::from_secs(1);
 const RESTART_MESSAGE: &[u8] = b"\r\nthe portfolio is restarting, try again in a moment\r\n";
 /// How much longer than the portfolio's idle timer russh waits before dropping a connection.
 /// Before the shell starts, the setup deadline is the real limit; after it, this only has
@@ -130,13 +132,13 @@ async fn run_server(
         config.max_per_ip
     );
     let store = ContentStore::new(content, config.content_url.clone());
-    let _ = store.refresh_if_due();
     let mut gate = Gate::new(config.max_per_ip, config.max_sessions, Instant::now());
     let log = Arc::new(Log::new(Instant::now()));
     let mut summaries = tokio::time::interval(SUMMARY_INTERVAL);
     let busy: Arc<[u8]> = busy_reply(&ssh_config.server_id).into();
     let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let refresher = tokio::spawn(store.clone().run(shutdown_rx.clone()));
     let mut connections = JoinSet::new();
     tokio::pin!(stop);
     loop {
@@ -221,6 +223,9 @@ async fn run_server(
     // Every connection ends within a bounded time (Connection::run), so this cannot hang.
     while connections.join_next().await.is_some() {}
     log.summarize();
+    // The refresher stops as soon as it sees `shutdown`; a fetch it started runs on a
+    // blocking thread it does not wait for. Bound the wait anyway so it cannot stall exit.
+    let _ = timeout(REFRESHER_GRACE, refresher).await;
     Ok(())
 }
 
