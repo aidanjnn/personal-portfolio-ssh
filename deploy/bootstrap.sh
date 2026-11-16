@@ -106,7 +106,7 @@ fi
 
 log "Installing base packages"
 apt_get update
-apt_get install ca-certificates curl
+apt_get install ca-certificates curl unattended-upgrades
 
 install -m 0755 -d /etc/apt/keyrings
 
@@ -145,6 +145,8 @@ curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.tailscale-keyri
   -o /etc/apt/sources.list.d/tailscale.list
 
 log "Installing Docker and Tailscale packages"
+# On a re-run this also upgrades them to the latest release. A docker-ce
+# upgrade restarts dockerd; live-restore (below) keeps containers running.
 apt_get update
 apt_get install \
   docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
@@ -216,9 +218,10 @@ systemctl restart portfolio-ratelimit.service
 # answers port 22 on the tailnet address itself, so it never reaches the
 # portfolio container that owns port 22 on the public address.
 
-# --auth-key=file:PATH needs Tailscale 1.22 or later. The stable repository
-# always serves a current release, so this only catches a held old package.
-readonly MIN_TAILSCALE=1.22.0
+# --auth-key=file:PATH needs Tailscale 1.22 or later and `set --auto-update`
+# a recent release. The stable repository always serves a current one, so this
+# only catches a held old package.
+readonly MIN_TAILSCALE=1.56.0
 ts_version=$(tailscale version)
 ts_version=${ts_version%%$'\n'*}
 dpkg --compare-versions "${ts_version}" ge "${MIN_TAILSCALE}" \
@@ -241,6 +244,9 @@ TS_IP=$(tailscale ip -4 | head -n 1)
 [[ ${TS_IP} == 100.* ]] || die "no tailnet IPv4 address"
 ts_prefs=$(tailscale debug prefs 2>/dev/null || true)
 [[ ${ts_prefs} =~ \"RunSSH\":\ *true ]] || printf 'warning: could not confirm Tailscale SSH is on\n' >&2
+# Tailscale upgrades its own package through apt, so fixes arrive without a
+# bootstrap re-run.
+tailscale set --auto-update
 
 # --- OpenSSH off ---------------------------------------------------------------
 # The portfolio needs host port 22. Ubuntu 24.04 socket-activates sshd, so both
@@ -271,6 +277,29 @@ if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
   log "Disabling ufw (the NSG is the firewall)"
   ufw --force disable
 fi
+
+# --- Automatic updates and reboots ---------------------------------------------
+# unattended-upgrades installs Ubuntu's security updates daily. Kernel, libc
+# and OpenSSL fixes only take effect after a reboot, so it reboots by itself
+# when one is required, at 04:00 Pacific, the quietest hour for this site.
+# Visitors connected at that moment are dropped; Docker (restart:
+# unless-stopped), tailscaled and the rate limit all come back on boot.
+# Docker Engine comes from Docker's repository, which unattended-upgrades
+# leaves alone. Re-running this script upgrades it (apt-get install upgrades
+# installed packages) and may restart dockerd; live-restore keeps the
+# containers up meanwhile.
+log "Configuring automatic security updates (reboot at 04:00 Pacific if needed)"
+# Automatic-Reboot-Time is local time; the zone keeps it at 04:00 across DST.
+timedatectl set-timezone America/Los_Angeles
+put 0644 /etc/apt/apt.conf.d/52portfolio-unattended-upgrades <<'EOF'
+// Written by deploy/bootstrap.sh.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+EOF
+systemctl enable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
 
 # --- Swap ----------------------------------------------------------------------
 # Standard_B2ats_v2 has 1 GiB of RAM and no temporary disk. A small swap file

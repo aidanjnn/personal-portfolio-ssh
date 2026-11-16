@@ -309,7 +309,13 @@ free -m                                                        # 1 GiB RAM plus 
 
 The health check proves an SSH key exchange, not a full session. `restart: unless-stopped` restarts exited containers (including after reboots and unattended upgrades) but not merely unhealthy ones.
 
-**Patching.** Ubuntu's unattended-upgrades installs security updates but doesn't reboot. Docker and Tailscale come from their own repositories: once a month, over Tailscale SSH, run `apt-get update && apt-get upgrade` and reboot if `/var/run/reboot-required` exists. Then check the fingerprint.
+**Patching.** Mostly automatic:
+
+- **Ubuntu security updates:** unattended-upgrades installs them daily and, when one needs a reboot (kernel, libc, OpenSSL), reboots at **04:00 Pacific** (`bootstrap.sh` sets the VM's time zone to `America/Los_Angeles` and writes `/etc/apt/apt.conf.d/52portfolio-unattended-upgrades`). Visitors connected at that moment are dropped. Docker, the containers (`restart: unless-stopped`), tailscaled and the rate limit all come back on boot.
+- **Tailscale:** `tailscale set --auto-update` lets it upgrade its own package.
+- **Docker Engine** comes from Docker's repository, which unattended-upgrades doesn't touch. Once a month, over Tailscale SSH, run `apt-get update && apt-get upgrade`. Re-running `azure.sh` does the same for docker and tailscale, because bootstrap's `apt-get install` upgrades installed packages. A docker-ce upgrade restarts dockerd, and `live-restore` keeps the containers and their visitors' sessions running through it.
+
+After any manual upgrade or reboot, check the fingerprint.
 
 ## Risks
 
@@ -323,6 +329,7 @@ The health check proves an SSH key exchange, not a full session. `restart: unles
 | Visitors behind a shared NAT (campus, office, carrier) | They share one public address, so 3 concurrent sessions and one rate bucket between them. Raise `--max-per-ip` if that bites |
 | Real client IPs lost (Docker's `iptables` off, or a proxy in front) | Every visitor would count as one address. `daemon.json` pins `"iptables": true`; the launch checklist verifies real IPs |
 | A port published by mistake | The NSG admits only TCP 22, 2222, 80 and 443, whatever compose publishes |
+| Upgrades restart dockerd or reboot the VM | `live-restore` keeps containers up through a dockerd restart (bootstrap re-runs and manual upgrades upgrade docker-ce). Reboots happen only when an update requires one, at 04:00 Pacific, and everything starts on boot |
 | IPv6 | Not offered: IPv4 VNet and IP, no AAAA. Adding it needs a dual-stack VNet and IP, and a check that the container sees real IPv6 peers, since Docker's default bridge shows them all as the gateway and `--max-per-ip` would count them together |
 | Tailscale down or misconfigured | Run Command or the serial console ([Break-glass](#break-glass)) |
 | Auth key copy on the VM | The run-command script stays in a root-only agent directory. The key is one-off, tagged, and expires in a day |
