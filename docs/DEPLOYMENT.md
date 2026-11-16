@@ -37,7 +37,8 @@ x64, not Arm: the image is built for linux/amd64 only.
 | `deploy/Caddyfile` | `/opt/portfolio/Caddyfile` | Apex and `ssh.` redirects with Vercel's HSTS header, automatic Let's Encrypt, HTTP/1.1 and HTTP/2 only |
 | `deploy/fingerprint.sh` | `/opt/portfolio/fingerprint.sh` | Prints the host-key fingerprint to publish |
 | `deploy/ratelimit.sh` | `/usr/local/sbin/portfolio-ratelimit` | Per-address connection-rate limit in `DOCKER-USER`, run by `portfolio-ratelimit.service` after every docker start |
-| `.github/workflows/deploy.yml` | GitHub Actions | Builds/pushes the image on `v*` tags; optional rollout over Tailscale SSH |
+| `.github/workflows/deploy.yml` | GitHub Actions | Tests, then builds/pushes the image on `v*` tags; optional health-gated rollout over Tailscale SSH |
+| `.github/workflows/uptime.yml` | GitHub Actions | Every 30 minutes: SSH on 22 and the apex redirect. Opens an issue on failure, closes it on recovery |
 
 **Volumes.** The compose project is named `portfolio`, so volumes are `portfolio_host-key` (the SSH identity), `portfolio_caddy-data` (certificates) and `portfolio_caddy-config`. **Never run `docker compose down -v`.**
 
@@ -73,6 +74,8 @@ What to watch:
 - **Cost Management → Cost analysis**, grouped by resource, weekly. Set a budget alert (Cost Management → Budgets) at $5/month.
 - **Free-tier limits.** Exactly one B-series VM of this size. Keep the disk at 64 GiB: 30 GiB is a P4 and 128 GiB a P10, neither free. Snapshots and extra IPs cost money. A deallocated VM stops VM charges but not the static IP's.
 - **The end date.** When the credit runs out or the 12 months end, the subscription is disabled and the VM stops. Before month 11, renew Azure for Students (if still eligible) or upgrade to pay-as-you-go.
+
+**Credit and expiry.** Put two reminders in your calendar the day you provision, each with a week's warning: the date the $100 credit expires (shown on the sponsorship balance page) and the date the 12 months of free services end (12 months after sign-up). When either lapses, Azure disables the subscription and stops the VM: `ssh aidanjeon.com` and `https://aidanjeon.com` go dark (the uptime check opens an issue). `www.aidanjeon.com` stays up on Vercel, and email forwarding at Namecheap is unaffected. To bring the apex back without Azure, point the `@` A record at Vercel again (`216.198.79.1`; see [DNS cutover](#dns-cutover), Rollback).
 
 ## Prerequisites
 
@@ -384,14 +387,20 @@ Rollback never touches volumes. Keep at least the previous image: don't `docker 
 
 | Check | Target | Expect |
 | --- | --- | --- |
-| HTTP (no redirect following) | `https://aidanjeon.com` | `308`, `location` starts with `https://www.aidanjeon.com` |
-| TCP | `aidanjeon.com:22` | Open |
-| TCP | `ssh.aidanjeon.com:2222` | Open |
+| HTTP (no redirect following) | `https://aidanjeon.com` | `308`, `location` starts with `https://www.aidanjeon.com`. Checked by `uptime.yml` |
+| SSH | `aidanjeon.com:22` | Host key returned. Checked by `uptime.yml` |
+| TCP | `ssh.aidanjeon.com:2222` | Open (checked by each deploy's smoke test) |
 | TLS expiry | `aidanjeon.com`, `ssh.aidanjeon.com` | More than 14 days left (Caddy renews at ~30) |
 | Azure credit | Sponsorship balance, Cost analysis | No surprise charges; see [Cost](#cost) |
 | CPU credits | VM → Metrics → "CPU Credits Remaining" | Not near zero. B-series VMs drop to baseline CPU when credits run out |
 
-Use any external uptime service with free HTTP and TCP checks, alerting to email or phone. On the box:
+**Uptime check, no outside account.** `.github/workflows/uptime.yml` runs every 30 minutes (and on demand from the Actions tab) once `DEPLOY_ENABLED` is `true`. It checks that `ssh-keyscan -T 10 aidanjeon.com` gets a host key on port 22 and that `curl -sI https://aidanjeon.com` returns a `308` to `https://www.aidanjeon.com/`, retrying twice a minute apart. On failure it opens an issue titled "Uptime: aidanjeon.com is failing its checks" that mentions you, or comments on the open one, so GitHub emails you; once the checks pass it closes the issue. It needs only `issues: write`. Three things to know:
+
+- Make sure GitHub emails you: Settings → Notifications → "Participating, @mentions and custom" with email on (the issue @-mentions you), and keep watching the repository.
+- GitHub disables scheduled workflows in a public repository after 60 days without a commit, and emails a warning first. Push something, or re-enable it under Actions → Uptime.
+- Scheduled runs can start several minutes late at busy times; this is a coarse alarm, not an SLA monitor.
+
+On the box:
 
 ```sh
 docker compose -f /opt/portfolio/compose.prod.yaml ps          # health
@@ -414,7 +423,7 @@ After any manual upgrade or reboot, check the fingerprint.
 
 | Risk | Mitigation |
 | --- | --- |
-| Credit or 12-month free period runs out | The subscription is disabled and the VM stops. Budget alert, balance checks, and a decision before month 11 |
+| Credit or 12-month free period runs out | The subscription is disabled and the VM stops; apex and SSH go dark, `www` and email don't. Calendar reminders, budget alert, balance checks, and a decision before month 11 ([Credit and expiry](#cost)) |
 | Region policy or size restriction | `azure.sh` checks both and falls back to `westus2` |
 | Corporate or campus networks block outbound 22 | Advertise `ssh -p 2222 ssh.aidanjeon.com` next to the main command |
 | Host key loss | Offline backup, restored with `--no-start`. If truly lost: publish the new fingerprint with a dated note, and update `HOST_KEY_FINGERPRINT` |
@@ -449,7 +458,8 @@ After any manual upgrade or reboot, check the fingerprint.
 - [ ] Apex A record → VM; MX, TXT and `www` unchanged; test email forwarded
 - [ ] `curl -I https://aidanjeon.com` → 308 to www; `ssh aidanjeon.com` works from another network
 - [ ] Fingerprint and both connect commands published on the website
-- [ ] Uptime checks for HTTPS, tcp/22 and tcp/2222 alerting
+- [ ] `DEPLOY_ENABLED=true`, then Actions → Uptime → Run workflow passes; no open uptime issue
+- [ ] Calendar reminders set for the credit expiry and the end of the 12 free months
 - [ ] Repo variables set; `DEPLOY_ENABLED=true`; one tag deploy and one rollback rehearsed
 - [ ] Restart and reboot keep the same fingerprint
 - [ ] Checked in macOS Terminal, another terminal app, and Windows Terminal/OpenSSH
