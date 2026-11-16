@@ -462,13 +462,23 @@ fn prefixes(ip: IpAddr) -> Vec<(Prefix, usize)> {
 /// few reconnects are fine; a handshake flood is not.
 const CONNECTIONS_PER_MINUTE: f64 = 10.0;
 const CONNECTION_BURST: f64 = 20.0;
-/// Most ranges the connection rate remembers. Past it, ranges it does not know are let
-/// through, still under the concurrency limits, rather than locking out new visitors.
+/// Most ranges the connection rate remembers, so a flood from many addresses cannot grow it
+/// without bound.
 const RATE_TABLE_LIMIT: usize = 16_384;
+/// While the table is full, a range it does not know shares a coarser one instead: its IPv6
+/// /48 or IPv4 /24, with this multiple of one address's budget. Ranges the table knows keep
+/// their own budgets, so a full table never frees a range that is out of budget.
+const FALLBACK_FACTOR: usize = 16;
+/// Most coarse ranges remembered. Past it, every range neither table knows shares one last
+/// budget (the /0), so even a flood spread across the Internet stays rate-limited.
+const FALLBACK_TABLE_LIMIT: usize = 4096;
+const OVERFLOW_FACTOR: usize = 64;
 
 /// New-connection budgets per address range, keyed like `IpLimiter`, in memory only.
 struct ConnectionRate {
     buckets: HashMap<Prefix, Bucket>,
+    /// Budgets for the coarse ranges used while `buckets` is full.
+    fallback: HashMap<Prefix, Bucket>,
     pruned: Instant,
 }
 
@@ -476,60 +486,100 @@ impl ConnectionRate {
     fn new(now: Instant) -> Self {
         Self {
             buckets: HashMap::new(),
+            fallback: HashMap::new(),
             pruned: now,
         }
     }
 
-    /// Spends one connection from each of the peer's ranges, if all of them have one.
+    /// Spends one connection from each of the peer's ranges, if all of them have one. A
+    /// refused connection spends nothing and adds nothing to either table.
     fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
-        let prefixes = prefixes(ip);
-        let unknown = prefixes
-            .iter()
-            .filter(|(prefix, _)| !self.buckets.contains_key(prefix))
-            .count();
-        if self.buckets.len() + unknown > RATE_TABLE_LIMIT {
-            if now >= self.pruned + Duration::from_secs(1) {
-                self.prune(now);
-            }
-            if self.buckets.len() + unknown > RATE_TABLE_LIMIT {
-                return true;
-            }
+        let mut ranges = prefixes(ip);
+        if self.full(&ranges) && now >= self.pruned + Duration::from_secs(1) {
+            self.prune(now);
         }
-        for &(prefix, share) in &prefixes {
-            let share = share as f64;
-            self.buckets
-                .entry(prefix)
-                .or_insert_with(|| {
-                    Bucket::full(
-                        CONNECTIONS_PER_MINUTE / 60.0 * share,
-                        CONNECTION_BURST * share,
-                        now,
-                    )
-                })
-                .refill(now);
+        let mut coarse = None;
+        if self.full(&ranges) {
+            ranges.retain(|(prefix, _)| self.buckets.contains_key(prefix));
+            coarse = Some(self.coarse_range(ip));
         }
-        if prefixes
-            .iter()
-            .any(|(prefix, _)| self.buckets[prefix].tokens < 1.0)
+        // A range without a bucket yet would get a full one.
+        let budget = |table: &mut HashMap<Prefix, Bucket>, (prefix, _): (Prefix, usize)| {
+            table.get_mut(&prefix).is_none_or(|bucket| {
+                bucket.refill(now);
+                bucket.tokens >= 1.0
+            })
+        };
+        if !ranges.iter().all(|&range| budget(&mut self.buckets, range))
+            || !coarse.is_none_or(|range| budget(&mut self.fallback, range))
         {
             return false;
         }
-        for (prefix, _) in &prefixes {
-            if let Some(bucket) = self.buckets.get_mut(prefix) {
-                bucket.tokens -= 1.0;
-            }
+        for range in ranges {
+            spend(&mut self.buckets, range, now);
+        }
+        if let Some(range) = coarse {
+            spend(&mut self.fallback, range, now);
         }
         true
     }
 
+    /// Whether the table has no room for the `ranges` it does not know yet.
+    fn full(&self, ranges: &[(Prefix, usize)]) -> bool {
+        let unknown = ranges
+            .iter()
+            .filter(|(prefix, _)| !self.buckets.contains_key(prefix))
+            .count();
+        unknown > 0 && self.buckets.len() + unknown > RATE_TABLE_LIMIT
+    }
+
+    /// The coarse range a peer shares while the table is full: its /48 or /24, or, when the
+    /// fallback table is full too and does not know that range, the /0.
+    fn coarse_range(&self, ip: IpAddr) -> (Prefix, usize) {
+        let (network, length) = match ip.to_canonical() {
+            IpAddr::V6(v6) => (
+                IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & !(u128::MAX >> 48))),
+                48,
+            ),
+            IpAddr::V4(v4) => (IpAddr::V4((v4.to_bits() & !(u32::MAX >> 24)).into()), 24),
+        };
+        if self.fallback.len() < FALLBACK_TABLE_LIMIT
+            || self.fallback.contains_key(&(network, length))
+        {
+            ((network, length), FALLBACK_FACTOR)
+        } else {
+            let everything = match network {
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            };
+            ((everything, 0), OVERFLOW_FACTOR)
+        }
+    }
+
     /// Forgets ranges whose budget has refilled: a fresh entry would be identical.
     fn prune(&mut self, now: Instant) {
-        self.buckets.retain(|_, bucket| {
-            bucket.refill(now);
-            bucket.tokens < bucket.burst
-        });
+        for table in [&mut self.buckets, &mut self.fallback] {
+            table.retain(|_, bucket| {
+                bucket.refill(now);
+                bucket.tokens < bucket.burst
+            });
+        }
         self.pruned = now;
     }
+}
+
+/// Takes one connection from `prefix`'s budget in `table`, adding a full one if it is new.
+fn spend(table: &mut HashMap<Prefix, Bucket>, (prefix, share): (Prefix, usize), now: Instant) {
+    let share = share as f64;
+    let bucket = table.entry(prefix).or_insert_with(|| {
+        Bucket::full(
+            CONNECTIONS_PER_MINUTE / 60.0 * share,
+            CONNECTION_BURST * share,
+            now,
+        )
+    });
+    bucket.refill(now);
+    bucket.tokens -= 1.0;
 }
 
 const BUSY_MESSAGE: &str = "aidanjeon.com is busy; try again in a minute";
@@ -2078,17 +2128,109 @@ mod tests {
     }
 
     #[test]
-    fn a_full_rate_table_lets_unknown_addresses_through() {
+    fn a_refused_connection_adds_nothing_to_the_rate_table() {
         let start = Instant::now();
+        let mut rate = ConnectionRate::new(start);
+        let v6 = |bits: u128| IpAddr::V6(Ipv6Addr::from_bits(bits));
+        let network: u128 = 0x2001_0db8_0000_0100 << 64;
+        // Spend the /56's whole budget from its first /64s...
+        let burst = CONNECTION_BURST as usize * NETWORK_FACTOR;
+        let allowed = (0..burst as u128 * 2)
+            .filter(|i| rate.allow(v6(network | (i % NETWORK_FACTOR as u128) << 64 | 1), start))
+            .count();
+        assert_eq!(allowed, burst);
+        let known = rate.buckets.len();
+        // ...then every new /64 in it is refused without a bucket of its own.
+        for subnet in 100..200u128 {
+            assert!(!rate.allow(v6(network | subnet << 64 | 1), start));
+        }
+        assert_eq!(rate.buckets.len(), known);
+    }
+
+    /// Fills the rate table with admitted connections from 10.0.0.0/8, one per address.
+    fn full_rate_table(start: Instant) -> ConnectionRate {
         let mut rate = ConnectionRate::new(start);
         for i in 0..RATE_TABLE_LIMIT as u32 {
             assert!(rate.allow(IpAddr::V4((0x0a00_0000 + i).into()), start));
         }
-        let stranger: IpAddr = "192.0.2.1".parse().unwrap();
-        for _ in 0..100 {
-            assert!(rate.allow(stranger, start));
-        }
         assert_eq!(rate.buckets.len(), RATE_TABLE_LIMIT);
+        rate
+    }
+
+    #[test]
+    fn a_full_rate_table_sends_unknown_ranges_to_a_shared_coarse_budget() {
+        let start = Instant::now();
+        let mut rate = full_rate_table(start);
+        // Strangers share their /24's budget instead of getting through freely.
+        let stranger: IpAddr = "192.0.2.1".parse().unwrap();
+        let coarse = CONNECTION_BURST as usize * FALLBACK_FACTOR;
+        assert_eq!(
+            (0..1000).filter(|_| rate.allow(stranger, start)).count(),
+            coarse
+        );
+        assert!(
+            !rate.allow("192.0.2.200".parse().unwrap(), start),
+            "same /24"
+        );
+        assert!(
+            rate.allow("198.51.100.1".parse().unwrap(), start),
+            "another /24"
+        );
+        assert!(rate.allow("2001:db8::1".parse().unwrap(), start), "a /48");
+        assert_eq!(rate.buckets.len(), RATE_TABLE_LIMIT);
+        assert_eq!(rate.fallback.len(), 3);
+        // Known addresses keep their own budgets.
+        let known: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            (0..100).filter(|_| rate.allow(known, start)).count(),
+            CONNECTION_BURST as usize - 1
+        );
+        // Once both tables are full, the rest of the Internet shares one last budget.
+        for i in 0..(FALLBACK_TABLE_LIMIT - rate.fallback.len()) as u32 {
+            assert!(rate.allow(IpAddr::V4((0xac00_0000 + (i << 8)).into()), start));
+        }
+        let overflow = CONNECTION_BURST as usize * OVERFLOW_FACTOR;
+        let admitted = (0..overflow as u32 * 2)
+            .filter(|i| rate.allow(IpAddr::V4((0xc000_0000 + (i << 8)).into()), start))
+            .count();
+        assert_eq!(admitted, overflow);
+        assert_eq!(rate.fallback.len(), FALLBACK_TABLE_LIMIT + 1);
+        // Pruning frees both tables once budgets refill.
+        rate.prune(start + Duration::from_secs(3600));
+        assert!(rate.buckets.is_empty() && rate.fallback.is_empty());
+    }
+
+    #[test]
+    fn a_full_rate_table_still_enforces_the_ranges_it_knows() {
+        // The reviewer's case: one /56 spends its budget, then a flood from one /48 fills the
+        // table. The /56 must not get back in by rotating to /64s the table has never seen.
+        let start = Instant::now();
+        let mut rate = ConnectionRate::new(start);
+        let v6 = |bits: u128| IpAddr::V6(Ipv6Addr::from_bits(bits));
+        let network: u128 = 0x2001_0db8_0000_0100 << 64;
+        let burst = CONNECTION_BURST as usize * NETWORK_FACTOR;
+        let allowed = (0..burst as u128 * 2)
+            .filter(|i| rate.allow(v6(network | (i % NETWORK_FACTOR as u128) << 64 | 1), start))
+            .count();
+        assert_eq!(allowed, burst);
+        let flood: u128 = 0x2001_0db8_0abc_0000 << 64;
+        let mut subnet = 0u128;
+        while rate.buckets.len() < RATE_TABLE_LIMIT {
+            assert!(subnet < 1 << 16, "the /48 could not fill the table");
+            rate.allow(v6(flood | subnet << 64 | 1), start);
+            subnet += 1;
+        }
+        let later = start + Duration::from_millis(10);
+        let rotated = (0..100u128)
+            .filter(|k| rate.allow(v6(network | (200 + k) << 64 | 1), later))
+            .count();
+        assert_eq!(
+            rotated, 0,
+            "an exhausted /56 got back in through fresh /64s"
+        );
+        // Its neighbours in the same /48, unknown to the table, share the /48's budget.
+        let neighbour: u128 = 0x2001_0db8_0000_0200 << 64;
+        assert!(rate.allow(v6(neighbour | 1), later));
     }
 
     #[test]
