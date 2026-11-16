@@ -767,22 +767,12 @@ impl Drop for IpSlot {
 }
 
 fn load_or_create_key(path: &Path) -> Result<russh::keys::PrivateKey, Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err("Host key must be a regular file, not a symlink".into());
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err("Host key must have private permissions (chmod 600)".into());
-                }
-            }
-            return Ok(russh::keys::load_secret_key(path, None)?);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    match load_key(path) {
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+        loaded => return loaded,
     }
     let parent = path
         .parent()
@@ -798,8 +788,10 @@ fn load_or_create_key(path: &Path) -> Result<russh::keys::PrivateKey, Error> {
     directory.create(parent)?;
     let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
     let encoded = key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?;
-    // Write a temporary file and rename it into place, so a crash never leaves a
-    // truncated key that the next start would refuse to replace.
+    // Write a temporary file and link it into place, so a crash never leaves a truncated
+    // key that the next start would refuse to replace. Unlike a rename, the link fails if
+    // the key exists: when two servers start at once, the second keeps the first one's key
+    // instead of replacing a key the first may already be serving.
     let name = path.file_name().ok_or("Host key path must name a file")?;
     let temporary = parent.join(format!(
         ".{}.{}-{:x}.tmp",
@@ -807,15 +799,33 @@ fn load_or_create_key(path: &Path) -> Result<russh::keys::PrivateKey, Error> {
         std::process::id(),
         rand::random::<u64>()
     ));
-    let written = write_private(&temporary, encoded.as_bytes()).and_then(|()| {
-        fs::rename(&temporary, path)?;
-        sync_directory(parent)
-    });
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let linked = write_private(&temporary, encoded.as_bytes())
+        .and_then(|()| fs::hard_link(&temporary, path));
+    let _ = fs::remove_file(&temporary);
+    match linked {
+        Ok(()) => {
+            sync_directory(parent)?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => load_key(path),
+        Err(error) => Err(error.into()),
     }
-    written?;
-    Ok(key)
+}
+
+/// Loads the host key at `path`, which must be a private regular file.
+fn load_key(path: &Path) -> Result<russh::keys::PrivateKey, Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("Host key must be a regular file, not a symlink".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("Host key must have private permissions (chmod 600)".into());
+        }
+    }
+    Ok(russh::keys::load_secret_key(path, None)?)
 }
 
 /// Creates `path` (it must not exist) readable only by its owner and flushes it to disk.
@@ -832,7 +842,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Makes a rename inside `directory` durable.
+/// Makes a new link inside `directory` durable.
 fn sync_directory(directory: &Path) -> io::Result<()> {
     #[cfg(unix)]
     fs::File::open(directory)?.sync_all()?;
@@ -2643,6 +2653,45 @@ mod tests {
         assert!(load_or_create_key(&path).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "invalid private key");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn servers_starting_at_once_agree_on_one_host_key() {
+        let root = std::env::temp_dir().join(format!(
+            "portfolio-key-race-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = root.join("ssh_host_ed25519_key");
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let racers: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, start) = (path.clone(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    load_or_create_key(&path).unwrap().public_key().clone()
+                })
+            })
+            .collect();
+        let keys: Vec<_> = racers
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .collect();
+        let on_disk = load_or_create_key(&path).unwrap().public_key().clone();
+        assert!(
+            keys.iter().all(|key| *key == on_disk),
+            "a racer kept a replaced key"
+        );
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            ["ssh_host_ed25519_key"],
+            "temporary file left behind"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
