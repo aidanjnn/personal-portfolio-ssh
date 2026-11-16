@@ -514,8 +514,11 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The portfolio's viewport for a client's window. 300x100 is far more than the page column
+/// needs, and a full repaint at that size still fits one 64 KiB channel window; a larger
+/// window keeps the portfolio in its top-left corner.
 fn dimensions(cols: u32, rows: u32) -> Rect {
-    Rect::new(0, 0, cols.clamp(1, 400) as u16, rows.clamp(1, 200) as u16)
+    Rect::new(0, 0, cols.clamp(1, 300) as u16, rows.clamp(1, 100) as u16)
 }
 
 /// A connection's share of the global and per-address limits. Owned by the russh handler,
@@ -670,7 +673,9 @@ impl server::Handler for Visitor {
         _py: u32,
         _session: &mut Session,
     ) -> Result<(), Error> {
-        if self.channel == Some(channel) && self.started {
+        // Same-size changes (some terminals repeat them) would only cost a repaint.
+        if self.channel == Some(channel) && self.started && self.pty != Some(dimensions(cols, rows))
+        {
             self.resize(cols, rows);
             if let Some(control) = &self.control {
                 let _ = control.send(self.pty);
@@ -816,13 +821,25 @@ async fn run_session(
     // Record first: the task is aborted as soon as the client drops the connection.
     record.lock().unwrap_or_else(PoisonError::into_inner).reason = Some(reason);
     let farewell = farewell(entered, reason, &content.web);
-    if !farewell.is_empty() {
-        let _ = timeout(CLOSE_TIMEOUT, channel.data_bytes(farewell)).await;
-    }
     let status = u32::from(matches!(reason, Reason::Error | Reason::Panic));
-    let _ = timeout(CLOSE_TIMEOUT, channel.exit_status(status)).await;
-    let _ = timeout(CLOSE_TIMEOUT, channel.eof()).await;
-    let _ = timeout(CLOSE_TIMEOUT, channel.close()).await;
+    let (mut input, output) = channel.split();
+    let goodbye = async {
+        if !farewell.is_empty() {
+            let _ = timeout(CLOSE_TIMEOUT, output.data_bytes(farewell)).await;
+        }
+        let _ = timeout(CLOSE_TIMEOUT, output.exit_status(status)).await;
+        let _ = timeout(CLOSE_TIMEOUT, output.eof()).await;
+        let _ = timeout(CLOSE_TIMEOUT, output.close()).await;
+    };
+    // Input left unread (see Pacer::ready) would stall russh, and the goodbye behind it.
+    let discard = async {
+        while input.wait().await.is_some() {}
+        std::future::pending::<()>().await;
+    };
+    tokio::select! {
+        () = goodbye => {}
+        () = discard => {}
+    }
 }
 
 /// Resolves to `Err` with the panic payload if polling the inner future panics, so a bug in
@@ -850,33 +867,55 @@ async fn run_portfolio(
     mut limits: Limits,
     links: bool,
 ) -> Result<Reason, Error> {
-    let mut terminal = None;
+    let mut terminal: Option<Terminal<CrosstermBackend<Vec<u8>>>> = None;
+    let mut area = Rect::default();
     let mut app = App::default();
     let mut decoder = Decoder::default();
+    let mut pacer = Pacer::new(Instant::now());
     let mut last_input = Instant::now();
     let mut escape_deadline = None;
     let reason = loop {
         let escape_at = escape_deadline.unwrap_or_else(|| Instant::now() + limits.idle);
+        let reading = pacer.ready(Instant::now());
         tokio::select! {
             biased;
             changed = control.changed() => {
                 if changed.is_err() { break Reason::Closed; }
                 let size = *control.borrow_and_update();
-                if let Some(size) = size {
+                if let Some(size) = size.filter(|size| terminal.is_none() || *size != area) {
                     let mut new_terminal = Terminal::with_options(CrosstermBackend::new(Vec::new()), TerminalOptions { viewport: Viewport::Fixed(size) })?;
-                    new_terminal.backend_mut().write_all(if terminal.is_none() { ENTER } else { b"\x1b[2J\x1b[H" })?;
+                    // Carry over bytes not yet sent, such as the switch to the alternate
+                    // screen when the window changes before the first frame goes out.
+                    let prefix = match terminal.as_mut() {
+                        None => ENTER.to_vec(),
+                        Some(old) => [std::mem::take(old.backend_mut().writer_mut()).as_slice(), b"\x1b[2J\x1b[H"].concat(),
+                    };
+                    new_terminal.backend_mut().write_all(&prefix)?;
                     terminal = Some(new_terminal);
+                    area = size;
                     *entered = true;
+                    pacer.changed();
                 }
             }
             _ = limits.shutdown.wait_for(|stopping| *stopping) => break Reason::Restart,
             _ = sleep_until(limits.deadline) => break Reason::Limit,
             _ = sleep_until(last_input + limits.idle) => break Reason::Idle,
             _ = sleep_until(escape_at), if escape_deadline.is_some() => {
-                if let Some(key) = decoder.expire_escape() { app.handle_key(key); }
                 escape_deadline = None;
+                let mut keys: Vec<_> = decoder.expire_escape().into_iter().collect();
+                pacer.admit(Instant::now(), &mut keys);
+                if !keys.is_empty() {
+                    dispatch_keys(area, &mut app, content, keys);
+                    pacer.changed();
+                }
             }
-            event = channel.wait() => {
+            // The latest state is always drawn, at most once per FRAME_INTERVAL.
+            _ = sleep_until(pacer.next_frame), if pacer.dirty => {}
+            // Out of key budget: input stays unread, russh's small channel buffer fills, and
+            // TCP backpressure slows the client, instead of the server decrypting a flood
+            // only to drop it.
+            _ = sleep_until(pacer.next_key()), if !reading => {}
+            event = channel.wait(), if reading => {
                 match event {
                     None | Some(ChannelMsg::Eof | ChannelMsg::Close) => break Reason::Closed,
                     Some(ChannelMsg::Data { data }) if terminal.is_some() => {
@@ -885,9 +924,12 @@ async fn run_portfolio(
                             panic!("injected portfolio panic");
                         }
                         last_input = Instant::now();
-                        let keys = packet_keys(&mut decoder, &data);
-                        let area = terminal.as_mut().unwrap().get_frame().area();
-                        dispatch_keys(area, &mut app, content, keys);
+                        let mut keys = packet_keys(&mut decoder, &data);
+                        pacer.admit(last_input, &mut keys);
+                        if !keys.is_empty() {
+                            dispatch_keys(area, &mut app, content, keys);
+                            pacer.changed();
+                        }
                         escape_deadline = decoder.has_escape().then(|| Instant::now() + ESCAPE_TIMEOUT);
                     }
                     Some(ChannelMsg::Signal { signal: russh::Sig::INT | russh::Sig::TERM }) => break Reason::Closed,
@@ -898,12 +940,106 @@ async fn run_portfolio(
         if app.quit {
             break Reason::Quit;
         }
-        if let Some(terminal) = &mut terminal {
+        if let Some(terminal) = &mut terminal
+            && pacer.frame_due(Instant::now())
+        {
             let bytes = render_frame(terminal, &mut app, content, links)?;
             timeout(WRITE_TIMEOUT, channel.data_bytes(bytes)).await??;
+            pacer.drew(Instant::now());
         }
     };
     Ok(reason)
+}
+
+/// A token bucket: holds up to `burst` tokens and regains `per_second` of them.
+#[derive(Clone, Copy, Debug)]
+struct Bucket {
+    per_second: f64,
+    burst: f64,
+    tokens: f64,
+    updated: Instant,
+}
+
+impl Bucket {
+    fn full(per_second: f64, burst: f64, now: Instant) -> Self {
+        Self {
+            per_second,
+            burst,
+            tokens: burst,
+            updated: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.per_second).min(self.burst);
+        self.updated = now;
+    }
+
+    /// Takes up to `wanted` whole tokens and returns how many it took.
+    fn take(&mut self, now: Instant, wanted: usize) -> usize {
+        self.refill(now);
+        let taken = (self.tokens as usize).min(wanted);
+        self.tokens -= taken as f64;
+        taken
+    }
+}
+
+/// Keys a session may apply: a held-down key repeats at roughly 30 per second, so 60 per
+/// second with a burst of 30 never drops typing, only floods.
+const KEYS_PER_SECOND: f64 = 60.0;
+const KEY_BURST: f64 = 30.0;
+/// At most ~30 frames per second per session.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Caps a session's CPU however fast its client sends: keys beyond the key budget are
+/// dropped rather than queued, and changes are drawn at most once per `FRAME_INTERVAL`, so
+/// a burst of input or of window changes becomes one frame showing the final state.
+struct Pacer {
+    keys: Bucket,
+    /// Something changed since the last frame.
+    dirty: bool,
+    next_frame: Instant,
+}
+
+impl Pacer {
+    fn new(now: Instant) -> Self {
+        Self {
+            keys: Bucket::full(KEYS_PER_SECOND, KEY_BURST, now),
+            dirty: false,
+            next_frame: now,
+        }
+    }
+
+    /// Keeps the keys the budget allows and drops the rest.
+    fn admit(&mut self, now: Instant, keys: &mut Vec<crossterm::event::KeyEvent>) {
+        keys.truncate(self.keys.take(now, keys.len()));
+    }
+
+    fn changed(&mut self) {
+        self.dirty = true;
+    }
+
+    fn frame_due(&self, now: Instant) -> bool {
+        self.dirty && now >= self.next_frame
+    }
+
+    fn drew(&mut self, now: Instant) {
+        self.dirty = false;
+        self.next_frame = now + FRAME_INTERVAL;
+    }
+
+    /// Whether a key could be applied now. Until one can, input is left unread.
+    fn ready(&mut self, now: Instant) -> bool {
+        self.keys.refill(now);
+        self.keys.tokens >= 1.0
+    }
+
+    /// When the budget next holds a whole key.
+    fn next_key(&self) -> Instant {
+        let missing = (1.0 - self.keys.tokens).max(0.0);
+        self.keys.updated + Duration::from_secs_f64(missing / self.keys.per_second)
+    }
 }
 
 /// Bytes sent as a session ends: restore the visitor's screen, then say why.
@@ -1450,9 +1586,108 @@ mod tests {
 
     #[test]
     fn dimensions_cannot_allocate_unbounded_buffers() {
-        assert_eq!(dimensions(u32::MAX, u32::MAX), Rect::new(0, 0, 400, 200));
+        assert_eq!(dimensions(u32::MAX, u32::MAX), Rect::new(0, 0, 300, 100));
         assert_eq!(dimensions(0, 0), Rect::new(0, 0, 1, 1));
         assert_eq!(dimensions(80, 24), Rect::new(0, 0, 80, 24));
+    }
+
+    #[test]
+    fn a_full_repaint_at_the_largest_viewport_fits_one_channel_window() {
+        let content = Portfolio::bundled().unwrap();
+        let mut largest = 0;
+        for theme in [crate::app::Theme::Paper, crate::app::Theme::Night] {
+            for key in *b"hwpt?" {
+                let mut terminal = Terminal::with_options(
+                    CrosstermBackend::new(Vec::new()),
+                    TerminalOptions {
+                        viewport: Viewport::Fixed(dimensions(u32::MAX, u32::MAX)),
+                    },
+                )
+                .unwrap();
+                let mut app = App {
+                    theme,
+                    ..App::default()
+                };
+                let keys = Decoder::default().feed(&[key]);
+                dispatch_keys(dimensions(u32::MAX, u32::MAX), &mut app, &content, keys);
+                let bytes = render_frame(&mut terminal, &mut app, &content, true).unwrap();
+                largest = largest.max(bytes.len());
+            }
+        }
+        assert!(largest < 65536, "{largest} bytes");
+    }
+
+    #[test]
+    fn a_key_flood_is_capped_and_drawn_at_a_bounded_frame_rate() {
+        let start = Instant::now();
+        let mut pacer = Pacer::new(start);
+        let (mut applied, mut frames) = (0, 0);
+        // A full packet of keys every millisecond for one second.
+        for ms in 0..1000 {
+            let now = start + Duration::from_millis(ms);
+            let mut keys =
+                vec![
+                    crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j'));
+                    MAX_KEYS
+                ];
+            pacer.admit(now, &mut keys);
+            if !keys.is_empty() {
+                applied += keys.len();
+                pacer.changed();
+            }
+            if pacer.frame_due(now) {
+                frames += 1;
+                pacer.drew(now);
+            }
+        }
+        let burst = KEY_BURST as usize;
+        let refill = KEYS_PER_SECOND as usize;
+        assert!(
+            (burst + refill - 2..=burst + refill).contains(&applied),
+            "{applied} keys"
+        );
+        assert!(frames <= 31, "{frames} frames");
+        // Out of budget, input is left unread until the next whole key.
+        let mut fresh = Pacer::new(start);
+        let mut keys =
+            vec![crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')); MAX_KEYS];
+        fresh.admit(start, &mut keys);
+        assert!(!fresh.ready(start));
+        let next = fresh.next_key();
+        assert!(
+            next > start && next <= start + Duration::from_millis(17),
+            "{:?}",
+            next - start
+        );
+        assert!(fresh.ready(next));
+        // The flood's last change has been drawn, or is due within one frame interval.
+        let after = start + Duration::from_millis(999) + FRAME_INTERVAL;
+        assert!(!pacer.dirty || pacer.frame_due(after));
+        // Ordinary typing is never dropped: a burst of ten keys after a pause.
+        let later = after + Duration::from_secs(1);
+        let mut keys =
+            vec![crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')); 10];
+        pacer.admit(later, &mut keys);
+        assert_eq!(keys.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn a_key_flood_neither_ends_the_session_nor_queues_keys() {
+        let server = TestServer::start(test_config()).await;
+        let mut visit = Visit::open(server.addr, true).await;
+        visit.read_until(ENTER).await;
+        // Far more keys than the budget allows, all at once.
+        for _ in 0..50 {
+            visit.send(&[b'j'; MAX_KEYS]).await;
+        }
+        // Once the budget refills, the next key applies at once: nothing queued before it.
+        sleep(Duration::from_millis(1500)).await;
+        visit.output.clear();
+        visit.send(b"w").await;
+        visit.read_until(b"Copperlane").await;
+        visit.send(b"q").await;
+        visit.read_until(b"thanks for stopping by").await;
+        server.stop().await;
     }
 
     #[test]
