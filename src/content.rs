@@ -1,7 +1,9 @@
 use std::{error::Error, fmt, ops::Deref};
 
 use serde::{Deserialize, Serialize};
-use unicode_properties::{GeneralCategory, UnicodeEmoji, UnicodeGeneralCategory};
+use unicode_properties::{
+    GeneralCategory, GeneralCategoryGroup, UnicodeEmoji, UnicodeGeneralCategory,
+};
 use unicode_width::UnicodeWidthChar;
 
 pub const BUNDLED_JSON: &str = include_str!("../content/portfolio.json");
@@ -326,6 +328,7 @@ fn validate_text(field: &str, text: &str, maximum: usize) -> Result<(), ContentE
 
 const ZWJ: char = '\u{200d}';
 const VS16: char = '\u{fe0f}';
+pub const MAX_COMBINING_MARKS: usize = 8;
 /// Hangul fillers are letters (Lo) that draw nothing, so no category rule catches them.
 const HANGUL_FILLERS: [char; 4] = ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'];
 
@@ -357,8 +360,13 @@ fn is_emoji(ch: char) -> bool {
 /// U+200D ZERO WIDTH JOINER, and only inside an emoji ZWJ sequence (👩‍💻, ❤️‍🔥): right after an
 /// emoji (optionally with VS16) and right before another. Those sequences are common in written
 /// text and render as one glyph; anywhere else a ZWJ is just an invisible character.
+///
+/// It also caps consecutive combining marks (Mn, Mc, Me) at `MAX_COMBINING_MARKS`: real text
+/// stacks a few at most, while "zalgo" stacks draw far outside their cell and make one
+/// terminal cell carry an unbounded symbol.
 fn reject_unsafe_chars(field: &str, text: &str) -> Result<(), ContentError> {
     let mut after_emoji = false;
+    let mut marks = 0;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         let safe = if ch == ZWJ {
@@ -373,6 +381,15 @@ fn reject_unsafe_chars(field: &str, text: &str) -> Result<(), ContentError> {
             )));
         }
         after_emoji = is_emoji(ch) || (after_emoji && ch == VS16);
+        marks = match ch.general_category_group() {
+            GeneralCategoryGroup::Mark => marks + 1,
+            _ => 0,
+        };
+        if marks > MAX_COMBINING_MARKS {
+            return Err(ContentError(format!(
+                "{field} stacks more than {MAX_COMBINING_MARKS} combining marks on one character"
+            )));
+        }
     }
     Ok(())
 }
@@ -570,6 +587,21 @@ mod tests {
         ] {
             assert!(validate_text("t", text, 64).is_err(), "accepted {text:?}");
         }
+    }
+
+    #[test]
+    fn caps_stacked_combining_marks() {
+        let stack = |count: usize| format!("Zalgo{} ok", "\u{301}\u{316}".repeat(count / 2));
+        assert!(validate_text("t", &stack(MAX_COMBINING_MARKS), 128).is_ok());
+        assert!(validate_text("t", &stack(MAX_COMBINING_MARKS + 2), 128).is_err());
+        // Any mark category counts (Mn, Mc, Me), and the count restarts after each base.
+        let mixed = format!("a{}\u{903}", "\u{301}".repeat(MAX_COMBINING_MARKS));
+        assert!(validate_text("t", &mixed, 128).is_err());
+        let spread = "a\u{301}\u{302}\u{303}".repeat(40);
+        assert!(validate_text("t", &spread, 1024).is_ok());
+        let mut content = bundled_data();
+        content.projects[0].title = stack(64);
+        assert!(content.validate().is_err());
     }
 
     #[test]

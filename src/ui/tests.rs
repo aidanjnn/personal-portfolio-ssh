@@ -962,6 +962,20 @@ fn combining_marks_join_the_previous_cell() {
 }
 
 #[test]
+fn a_stack_of_marks_is_written_to_its_cell_once() {
+    // `put` sets each cluster's symbol in one step, so a long stack costs linear time rather
+    // than rebuilding the cell's string for every mark.
+    let marks = "\u{301}".repeat(crate::content::MAX_COMBINING_MARKS);
+    let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+    assert_eq!(
+        put(&mut buf, 0, 0, &format!("a{marks}b"), Style::default(), 4),
+        2
+    );
+    assert_eq!(buf[(0, 0)].symbol(), format!("a{marks}"));
+    assert_eq!(buf[(1, 0)].symbol(), "b");
+}
+
+#[test]
 fn emoji_clusters_fill_the_cells_ratatui_skips() {
     use ratatui::buffer::CellWidth;
     let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
