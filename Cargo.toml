@@ -2,7 +2,7 @@
 name = "personal-portfolio-tui"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.100"
 description = "Aidan Jeon's terminal portfolio for local terminals and SSH"
 repository = "https://github.com/aidanjnn/personal-portfolio-ssh"
 publish = false
