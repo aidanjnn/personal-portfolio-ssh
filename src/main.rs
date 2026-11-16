@@ -1,5 +1,7 @@
 mod app;
 mod content;
+mod input;
+mod ssh;
 mod text;
 mod theme;
 mod ui;
@@ -8,6 +10,7 @@ use crossterm::event::{self, Event};
 use std::{
     ffi::OsStr,
     io::{self, IsTerminal, Write},
+    time::Duration,
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -16,7 +19,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n\nOptions:\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
+            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n  personal-portfolio-tui serve [OPTIONS]\n\nServer options:\n  --bind ADDRESS           Listen address (default 127.0.0.1:2222)\n  --host-key PATH          Persistent Ed25519 key (default data/ssh_host_ed25519_key)\n  --max-sessions COUNT     Concurrent connections, 1–256 (default 32)\n  --max-per-ip COUNT       Concurrent connections per client address, 1–32 (default 3)\n  --idle-timeout SECS      Input inactivity timeout, 1–3600 (default 300)\n  --max-session-secs SECS  Hard session length, 60–86400 (default 1800)\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nAnonymous SSH only runs the portfolio. PTY required; no commands or forwarding.\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
         );
         return Ok(());
     }
@@ -24,6 +27,13 @@ fn main() -> Result<(), Error> {
     if args == ["--print-content"] {
         println!("{}", serde_json::to_string_pretty(&content)?);
         return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "serve") {
+        let config = parse_server_args(&args[1..])?;
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(ssh::serve(config, content));
     }
     let links = match args.as_slice() {
         [] => true,
@@ -44,6 +54,42 @@ fn main() -> Result<(), Error> {
     // The restored terminal translates newlines itself.
     println!("\n{}", ui::goodbye(&content.web));
     Ok(())
+}
+
+fn parse_server_args(args: &[String]) -> Result<ssh::Config, Error> {
+    let mut config = ssh::Config::default();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--no-links" {
+            config.links = false;
+            continue;
+        }
+        let value = args
+            .next()
+            .ok_or("Missing server option value; use --help.")?;
+        match arg.as_str() {
+            "--bind" => config.bind = value.parse()?,
+            "--host-key" => config.host_key = value.into(),
+            "--max-sessions" => config.max_sessions = value.parse()?,
+            "--max-per-ip" => config.max_per_ip = value.parse()?,
+            "--idle-timeout" => config.idle_timeout = Duration::from_secs(value.parse()?),
+            "--max-session-secs" => config.max_session = Duration::from_secs(value.parse()?),
+            _ => return Err("Unknown server option; use --help.".into()),
+        }
+    }
+    if !(1..=256).contains(&config.max_sessions) {
+        return Err("--max-sessions must be 1–256".into());
+    }
+    if !(1..=32).contains(&config.max_per_ip) {
+        return Err("--max-per-ip must be 1–32".into());
+    }
+    if !(1..=3600).contains(&config.idle_timeout.as_secs()) {
+        return Err("--idle-timeout must be 1–3600 seconds".into());
+    }
+    if !(60..=86400).contains(&config.max_session.as_secs()) {
+        return Err("--max-session-secs must be 60–86400 seconds".into());
+    }
+    Ok(config)
 }
 
 /// Honours https://no-color.org: any non-empty `NO_COLOR` selects the plain theme.
@@ -82,6 +128,39 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_config_defaults_to_localhost_and_rejects_unbounded_limits() {
+        let config = parse_server_args(&[]).unwrap();
+        assert_eq!(config.bind.to_string(), "127.0.0.1:2222");
+        assert_eq!(config.max_per_ip, 3);
+        assert_eq!(config.max_session, Duration::from_secs(1800));
+        for args in [
+            ["--max-sessions", "0"],
+            ["--max-sessions", "257"],
+            ["--idle-timeout", "0"],
+            ["--idle-timeout", "3601"],
+            ["--max-per-ip", "0"],
+            ["--max-per-ip", "33"],
+            ["--max-per-ip", "-1"],
+            ["--max-session-secs", "59"],
+            ["--max-session-secs", "86401"],
+        ] {
+            assert!(parse_server_args(&args.map(String::from)).is_err());
+        }
+    }
+
+    #[test]
+    fn server_config_accepts_limit_bounds() {
+        for (flag, value) in [
+            ("--max-per-ip", "1"),
+            ("--max-per-ip", "32"),
+            ("--max-session-secs", "60"),
+            ("--max-session-secs", "86400"),
+        ] {
+            assert!(parse_server_args(&[flag.into(), value.into()]).is_ok());
+        }
+    }
 
     #[test]
     fn no_color_selects_the_plain_theme() {
