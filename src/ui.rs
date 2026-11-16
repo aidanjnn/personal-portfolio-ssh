@@ -2,9 +2,6 @@
 //! a footer and a status bar, styled with the aidanjeon.com tokens.
 mod escapes;
 
-// `base64` stays part of the `ui` API; only tests call it outside `clipboard_escape`.
-#[allow(unused_imports)]
-pub use escapes::base64;
 pub use escapes::{clipboard_escape, link_escapes};
 use ratatui::{
     Frame,
