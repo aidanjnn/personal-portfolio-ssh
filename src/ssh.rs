@@ -81,14 +81,35 @@ impl Default for Config {
     }
 }
 
-/// Serves the portfolio over anonymous SSH until Ctrl+C.
+/// Serves the portfolio over anonymous SSH until SIGTERM or SIGINT.
 pub async fn serve(config: Config, content: Portfolio) -> Result<(), Error> {
+    // Registered first, so a stop request during startup is not the default (fatal) action.
+    let stop = stop_signal()?;
     let key = load_or_create_key(&config.host_key)?;
     let listener = TcpListener::bind(config.bind).await?;
-    let stop = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
     run_server(listener, key, config, content, stop).await
+}
+
+/// Resolves on SIGTERM (`docker stop`, systemd) or SIGINT (Ctrl+C). Both stop the server
+/// the same graceful way: every visitor's screen is restored before the process exits.
+#[cfg(unix)]
+fn stop_signal() -> io::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn stop_signal() -> io::Result<impl Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 
 /// Accepts visitors on `listener` until `stop` resolves, then lets each one say goodbye.

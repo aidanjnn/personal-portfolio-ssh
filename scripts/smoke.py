@@ -155,6 +155,7 @@ PAPER_CANVAS = b"48;2;255;255;255"
 NIGHT_CANVAS = b"48;2;17;22;27"
 GOODBYE = b"thanks for stopping by"
 TIME_LIMIT = b"session time limit reached"
+RESTARTING = b"the portfolio is restarting"
 HOME = "University of Waterloo"
 COPPERLANE_URL = "https://www.copperlane.ai/"
 OTTO_URL = "https://github.com/abrj7/otto"
@@ -520,9 +521,11 @@ def check_ssh(binary, output, port, slow=False):
             process.kill()
             raise AssertionError("SSH server never listened")
 
-        def stop(process):
-            process.terminate()
-            process.wait(timeout=5)
+        def stop(process, sig=signal.SIGTERM):
+            """Stop the server the way docker or systemd does; it must exit cleanly."""
+            process.send_signal(sig)
+            status = process.wait(timeout=10)
+            assert status == 0, f"server exited with status {status} on {sig.name}"
 
         def server_log():
             return log_path.read_text(errors="replace")
@@ -669,8 +672,27 @@ def check_ssh(binary, output, port, slow=False):
                 wait_idle()
             checks.ok("exec, sftp subsystem, no-PTY shell, remote and direct forwarding rejected")
 
-            stop(server)
-            server, _ = start()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                live = session(f"ssh-live-{sig.name.lower()}")
+                live.wait_for(HOME)
+                started = time.monotonic()
+                server.send_signal(sig)
+                # Keep reading the visitor's PTY: a full PTY would block ssh, not the server.
+                deadline = started + 10
+                while time.monotonic() < deadline and None in (server.poll(), live.process.poll()):
+                    live.drain(0.1)
+                live.drain()
+                live.capture("stopped")
+                assert server.poll() == 0, f"{sig.name}: server exited with {server.poll()}"
+                server = None
+                status = live.process.poll()
+                assert after_alternate_screen(live.wire, RESTARTING), \
+                    f"{sig.name}: restart notice missing or written before leaving the alternate screen"
+                assert live.restored(), f"{sig.name}: visitor's terminal attributes not restored"
+                assert status == 0, f"{sig.name}: visitor's ssh exited with status {status}"
+                checks.ok(f"{sig.name} with a live visitor: screen restored, restart notice, "
+                          f"server exits 0 in {time.monotonic() - started:.1f}s")
+                server, _ = start()
             assert key.read_bytes() == original_key, "host key changed across restart"
             restarted = session("ssh-restarted")
             check_home(restarted, Checks("ignored"))
@@ -737,7 +759,13 @@ def check_ssh(binary, output, port, slow=False):
             for terminal in sessions:
                 terminal.close()
             if server is not None and server.poll() is None:
-                stop(server)
+                # No assertions here: they would hide the failure that got us here.
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=5)
             log.close()
     return checks
 
