@@ -8,7 +8,7 @@ Rendered frames: [home](docs/screens/page-home-100x30.txt), [996](docs/screens/p
 
 ## Run it
 
-Install Rust 1.89+ with [rustup](https://rustup.rs/).
+Install [rustup](https://rustup.rs/). It picks up the toolchain pinned in `rust-toolchain.toml` (Rust 1.100.0, the one CI and the Docker build use) on first use.
 
 ```sh
 cargo run --locked                 # in this terminal

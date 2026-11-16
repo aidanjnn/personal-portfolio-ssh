@@ -3,7 +3,8 @@
 # one, pick the new tag and look up its index digest:
 #   docker buildx imagetools inspect rust:<version>-bookworm   # "Digest: sha256:..."
 #   docker buildx imagetools inspect debian:bookworm-<date>-slim
-# Keep both stages on the same Debian release so the binary's glibc matches.
+# Keep both stages on the same Debian release so the binary's glibc matches,
+# and the Rust version equal to the channel in rust-toolchain.toml, which CI uses.
 ARG RUST_IMAGE=rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /build
