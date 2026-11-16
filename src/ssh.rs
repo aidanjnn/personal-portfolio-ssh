@@ -1,4 +1,4 @@
-use crate::{app::App, content::Portfolio, input::Decoder, ui};
+use crate::{app::App, content::Portfolio, input::Decoder, store::ContentStore, ui};
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 use russh::{
     Channel, ChannelId, ChannelMsg, Disconnect, Pty,
@@ -63,6 +63,7 @@ pub struct Config {
     pub max_session: Duration,
     /// Not a flag: tests shorten it.
     pub setup_timeout: Duration,
+    pub content_url: Option<String>,
     pub links: bool,
 }
 
@@ -76,6 +77,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(300),
             max_session: Duration::from_secs(1800),
             setup_timeout: SETUP_TIMEOUT,
+            content_url: None,
             links: true,
         }
     }
@@ -127,7 +129,8 @@ async fn run_server(
         config.max_sessions,
         config.max_per_ip
     );
-    let content = Arc::new(content);
+    let store = ContentStore::new(content, config.content_url.clone());
+    let _ = store.refresh_if_due();
     let mut gate = Gate::new(config.max_per_ip, config.max_sessions, Instant::now());
     let log = Arc::new(Log::new(Instant::now()));
     let mut summaries = tokio::time::interval(SUMMARY_INTERVAL);
@@ -177,7 +180,7 @@ async fn run_server(
                     shutdown: shutdown_rx.clone(),
                 };
                 let handler = Visitor::new(
-                    Arc::clone(&content),
+                    store.snapshot(),
                     limits,
                     config.links,
                     Arc::clone(&record),

@@ -477,6 +477,14 @@ fn valid_uri_tail(tail: &str) -> bool {
     true
 }
 
+/// Validates a snapshot source with the content URL rules, restricted to HTTPS.
+pub fn validate_https_url(field: &str, url: &str) -> Result<(), ContentError> {
+    if !url.starts_with("https://") {
+        return Err(ContentError(format!("{field} must be a public HTTPS URL")));
+    }
+    validate_url(field, url)
+}
+
 fn validate_url(field: &str, url: &str) -> Result<(), ContentError> {
     validate_text(field, url, URL_LIMIT)?;
     let valid = if let Some(rest) = url.strip_prefix("https://") {

@@ -2,6 +2,7 @@ mod app;
 mod content;
 mod input;
 mod ssh;
+mod store;
 mod text;
 mod theme;
 mod ui;
@@ -19,7 +20,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n  personal-portfolio-tui serve [OPTIONS]\n\nServer options:\n  --bind ADDRESS           Listen address (default 127.0.0.1:2222)\n  --host-key PATH          Persistent Ed25519 key (default data/ssh_host_ed25519_key)\n  --max-sessions COUNT     Concurrent connections, 1–256 (default 32)\n  --max-per-ip COUNT       Concurrent connections per client address, 1–32 (default 3)\n  --idle-timeout SECS      Input inactivity timeout, 1–3600 (default 300)\n  --max-session-secs SECS  Hard session length, 60–86400 (default 1800)\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nAnonymous SSH only runs the portfolio. PTY required; no commands or forwarding.\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
+            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n  personal-portfolio-tui serve [OPTIONS]\n\nServer options:\n  --bind ADDRESS           Listen address (default 127.0.0.1:2222)\n  --host-key PATH          Persistent Ed25519 key (default data/ssh_host_ed25519_key)\n  --max-sessions COUNT     Concurrent connections, 1–256 (default 32)\n  --max-per-ip COUNT       Concurrent connections per client address, 1–32 (default 3)\n  --idle-timeout SECS      Input inactivity timeout, 1–3600 (default 300)\n  --max-session-secs SECS  Hard session length, 60–86400 (default 1800)\n  --content-url URL        HTTPS portfolio.json to refresh from, at most once a minute\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nAnonymous SSH only runs the portfolio. PTY required; no commands or forwarding.\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
         );
         return Ok(());
     }
@@ -74,6 +75,10 @@ fn parse_server_args(args: &[String]) -> Result<ssh::Config, Error> {
             "--max-per-ip" => config.max_per_ip = value.parse()?,
             "--idle-timeout" => config.idle_timeout = Duration::from_secs(value.parse()?),
             "--max-session-secs" => config.max_session = Duration::from_secs(value.parse()?),
+            "--content-url" => {
+                content::validate_https_url("--content-url", value)?;
+                config.content_url = Some(value.clone());
+            }
             _ => return Err("Unknown server option; use --help.".into()),
         }
     }
@@ -135,6 +140,7 @@ mod tests {
         assert_eq!(config.bind.to_string(), "127.0.0.1:2222");
         assert_eq!(config.max_per_ip, 3);
         assert_eq!(config.max_session, Duration::from_secs(1800));
+        assert_eq!(config.content_url, None);
         for args in [
             ["--max-sessions", "0"],
             ["--max-sessions", "257"],
@@ -159,6 +165,30 @@ mod tests {
             ("--max-session-secs", "86400"),
         ] {
             assert!(parse_server_args(&[flag.into(), value.into()]).is_ok());
+        }
+    }
+
+    #[test]
+    fn server_config_accepts_only_https_content_urls() {
+        let args = ["--content-url", "https://www.aidanjeon.com/portfolio.json"];
+        let config = parse_server_args(&args.map(String::from)).unwrap();
+        assert_eq!(
+            config.content_url.as_deref(),
+            Some("https://www.aidanjeon.com/portfolio.json")
+        );
+        for url in [
+            "http://www.aidanjeon.com/portfolio.json",
+            "mailto:hello@aidanjeon.com",
+            "https://localhost/portfolio.json",
+            "https://www.aidanjeon.com/a b",
+            "https://user@www.aidanjeon.com/",
+            "file:///etc/passwd",
+            "",
+        ] {
+            assert!(
+                parse_server_args(&["--content-url".into(), url.into()]).is_err(),
+                "accepted {url:?}"
+            );
         }
     }
 
