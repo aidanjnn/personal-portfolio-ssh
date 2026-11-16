@@ -122,7 +122,7 @@ fn find(buffer: &Buffer, y: u16, needle: &str) -> u16 {
     text::width(&row[..byte])
 }
 
-fn key(app: &mut App, code: KeyCode) {
+pub(crate) fn key(app: &mut App, code: KeyCode) {
     app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
 }
 
@@ -531,41 +531,6 @@ fn leaving_a_page_resets_focus_and_scroll() {
 // Hyperlinks and clipboard.
 
 #[test]
-fn link_escapes_wrap_the_focused_url_in_osc_8() {
-    let (app, _) = scenario(&[KeyCode::Char('j')], 100, 30);
-    let escapes = link_escapes(&app);
-    let open = "\x1b]8;;https://www.copperlane.ai/\x1b\\";
-    assert!(escapes.contains(open), "{escapes:?}");
-    let label = &escapes[escapes.find(open).unwrap() + open.len()..];
-    let label = &label[..label.find("\x1b]8;;\x1b\\").unwrap()];
-    let visible: String = label
-        .split('\x1b')
-        .map(|part| part.split_once('m').map_or(part, |(_, text)| text))
-        .collect();
-    assert_eq!(visible, "Copperlane (YC W26)");
-    // Cursor saved, positioned at the link (row 10, col 41), reset and restored.
-    assert!(escapes.starts_with(
-        "\x1b7\x1b[10;41H\x1b[0;1;4;38;2;249;115;22;48;2;254;230;213m\x1b[58:2::249:115:22m"
-    ));
-    assert!(escapes.ends_with("\x1b]8;;\x1b\\\x1b[0m\x1b8"));
-    assert!(!escapes.contains("\x1b]52;"));
-}
-
-#[test]
-fn copy_emits_osc_52_once() {
-    let (mut app, buffer) = scenario(&[KeyCode::Char('j'), KeyCode::Char('c')], 100, 30);
-    assert!(dump(&buffer)[29].contains("copied ↗ copperlane.ai"));
-    // The clipboard write is separate from OSC 8, so --no-links still copies.
-    assert!(!link_escapes(&app).contains("\x1b]52;"));
-    let payload = format!("\x1b]52;c;{}\x07", base64(b"https://www.copperlane.ai/"));
-    assert_eq!(clipboard_escape(&mut app), payload);
-    assert_eq!(clipboard_escape(&mut app), "");
-    key(&mut app, KeyCode::Char('j'));
-    let buffer = render(&mut app, &content(), 100, 30);
-    assert!(!dump(&buffer)[29].contains("copied"));
-}
-
-#[test]
 fn a_copy_resolved_while_too_small_is_not_reported_as_copied() {
     let content = content();
     let mut app = App::default();
@@ -621,22 +586,6 @@ fn long_urls_wrap_in_the_link_sheet() {
             .iter()
             .all(|link| link.url == content.projects[0].url)
     );
-}
-
-#[test]
-fn base64_matches_known_vectors() {
-    for (input, expected) in [
-        ("", ""),
-        ("f", "Zg=="),
-        ("fo", "Zm8="),
-        ("foo", "Zm9v"),
-        ("foob", "Zm9vYg=="),
-        ("fooba", "Zm9vYmE="),
-        ("foobar", "Zm9vYmFy"),
-    ] {
-        assert_eq!(base64(input.as_bytes()), expected);
-    }
-    assert_eq!(base64(&[0xfb, 0xff]), "+/8=");
 }
 
 // Robustness.
