@@ -156,7 +156,7 @@ Pass `--location <region>` to force one.
 What `azure.sh` does, in order:
 
 1. Picks the region and checks the VM size there.
-2. Creates the resource group, VNet, NSG (no inbound allow rules), static IP and VM (`--nsg-rule NONE`). Existing resources are left alone.
+2. Creates the resource group, VNet, NSG (no inbound allow rules), static IP and VM (`--nsg-rule NONE`). Existing resources are left alone. Only a `NotFound` answer counts as missing; any other `az` error stops the script.
 3. Enables boot diagnostics, for the serial console.
 4. Sends `deploy/` to the VM inside one `az vm run-command invoke` script and runs `bootstrap.sh` as root. Bootstrap installs Docker (pinning `daemon.json`) and Tailscale, adds the rate limit, joins the tailnet with `tailscale up --ssh`, masks `ssh.socket` and `ssh.service`, adds a 1 GiB swap file, creates the `deploy` user, installs `/opt/portfolio`, pulls the image and starts the stack. It waits for the portfolio's health check and prints the fingerprint, then `BOOTSTRAP_OK`.
 5. Only on `BOOTSTRAP_OK`, adds the NSG rule for TCP 22, 2222, 80 and 443.
@@ -196,6 +196,7 @@ To keep the published fingerprint on a new VM, restore the key before the stack 
 | No `BOOTSTRAP_OK` | run-command returns only the last 4 KB of output. The full output is in `/var/lib/waagent/run-command/download/<n>/stdout` and `stderr` on the VM; read it with run-command ([below](#break-glass)). Fix the cause and re-run. The NSG stays closed until bootstrap succeeds |
 | `TS_AUTHKEY is required` or `tailscale up` fails | The key is missing, used or expired. Generate a new one and re-run |
 | run-command reports a conflict | Only one runs at a time. Wait and retry |
+| `could not tell whether the resource exists` | An `az ... show` failed with something other than `NotFound` (login expired, throttling, network, permissions). `azure.sh` stops rather than re-create the resource, since re-creating the NSG would wipe its allow rule. Fix the cause and re-run |
 
 ## Break-glass
 

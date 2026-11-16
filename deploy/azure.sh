@@ -74,8 +74,24 @@ note() { printf '%s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 show() { printf '+' >&2; printf ' %q' "$@" >&2; printf '\n' >&2; }
 run() { show "$@"; [[ ${dry_run} == 1 ]] || "$@"; }
-# True if the resource exists. A dry run assumes nothing exists yet.
-exists() { [[ ${dry_run} == 0 ]] && "$@" --output none >/dev/null 2>&1; }
+# True if the resource exists, false if az says it is not found. Any other
+# error (login, network, throttling, permissions) aborts: treating it as
+# "missing" would re-create the resource, and a re-PUT of the NSG would wipe
+# its allow rule. A dry run assumes nothing exists yet.
+exists() {
+  [[ ${dry_run} == 0 ]] || return 1
+  local err
+  if err=$("$@" --output none 2>&1 >/dev/null); then
+    return 0
+  fi
+  if grep -Eq '(\(|Code: )(Resource|ResourceGroup)?NotFound([^A-Za-z]|$)' <<<"${err}"; then
+    return 1
+  fi
+  printf 'error: could not tell whether the resource exists:' >&2
+  printf ' %q' "$@" >&2
+  printf '\n%s\n' "${err}" >&2
+  exit 1
+}
 
 # --- Arguments -----------------------------------------------------------------
 
@@ -144,8 +160,10 @@ sku_status() {
 }
 
 choose_location() {
-  local existing candidates loc status
-  existing=$(az network vnet show -g "${RG}" -n "${VNET}" --query location -o tsv 2>/dev/null || true)
+  local existing="" candidates loc status
+  if exists az group show -n "${RG}" && exists az network vnet show -g "${RG}" -n "${VNET}"; then
+    existing=$(az network vnet show -g "${RG}" -n "${VNET}" --query location -o tsv)
+  fi
   if [[ -n ${existing} ]]; then
     [[ -z ${location} || ${location} == "${existing}" ]] \
       || die "${VNET} already exists in ${existing}; delete resource group ${RG} to change regions"
