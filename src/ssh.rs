@@ -229,6 +229,7 @@ fn ssh_config(key: russh::keys::PrivateKey, idle: Duration) -> server::Config {
         inactivity_timeout: Some(idle + TRANSPORT_IDLE_MARGIN),
         auth_rejection_time: Duration::from_millis(200),
         max_auth_attempts: 3,
+        // The receive window: how much a client may send before the server reads it.
         window_size: 65536,
         maximum_packet_size: 32768,
         channel_buffer_size: 16,
@@ -852,8 +853,10 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
 }
 
 /// The portfolio's viewport for a client's window. 300x100 is far more than the page column
-/// needs, and a full repaint at that size still fits one 64 KiB channel window; a larger
-/// window keeps the portfolio in its top-left corner.
+/// needs and bounds what one repaint costs to draw and send (under 64 KiB); a larger window
+/// keeps the portfolio in its top-left corner. How fast the server may send is up to the
+/// window the client grants, not the server's `window_size`, which only limits what the
+/// client may send before the server reads it.
 fn dimensions(cols: u32, rows: u32) -> Rect {
     Rect::new(0, 0, cols.clamp(1, 300) as u16, rows.clamp(1, 100) as u16)
 }
@@ -2393,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_repaint_at_the_largest_viewport_fits_one_channel_window() {
+    fn a_full_repaint_at_the_largest_viewport_stays_under_64_kib() {
         let content = Portfolio::bundled().unwrap();
         let mut largest = 0;
         for theme in [crate::app::Theme::Paper, crate::app::Theme::Night] {
