@@ -79,7 +79,10 @@ jobs:
         id: existing
         env:
           REF: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # The package that holds every tag, as OWNER/NAME (user-owned).
+          package=${IMAGE#ghcr.io/}
           if out=$(docker buildx imagetools inspect "$REF" 2>&1); then
             digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$out")
             if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -92,6 +95,22 @@ jobs:
           elif grep -Eqi 'not found|manifest unknown|name unknown' <<<"$out"; then
             echo "$REF does not exist yet: testing and building it"
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          elif grep -Eqi 'denied|unauthorized' <<<"$out"; then
+            # GHCR answers DENIED, not "not found", while the package has no
+            # image at all (the first release). The packages API tells the two
+            # apart: 404 means there is no package yet, so nothing to reuse.
+            if api=$(gh api "users/${package%%/*}/packages/container/${package#*/}" --jq .name 2>&1); then
+              echo "::error::Package $package exists, but reading $REF was denied"
+              printf '%s\n' "$out"
+              exit 1
+            elif grep -q 'HTTP 404' <<<"$api"; then
+              echo "Package $package does not exist yet: testing and building $REF"
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Could not check $REF, or whether package $package exists"
+              printf '%s\n' "$out" "$api"
+              exit 1
+            fi
           else
             # Anything else (auth, network) must not fall through to a rebuild.
             echo "::error::Could not check $REF"
