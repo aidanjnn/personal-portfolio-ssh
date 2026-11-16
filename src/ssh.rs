@@ -1029,24 +1029,23 @@ fn packet_keys(decoder: &mut Decoder, data: &[u8]) -> Vec<crossterm::event::KeyE
     decoder.feed_up_to(data, MAX_KEYS)
 }
 
-/// Applies a packet's keys. Every key but the last only updates state and layout; the caller
-/// renders once afterwards, so a key-mash costs one frame, not one per key.
+/// Applies a packet's keys. Each key only updates state and layout; the caller renders at most
+/// once per `FRAME_INTERVAL`, so a key-mash costs one frame, not one per key.
+///
+/// Every key is laid out, the last one too: the next key may depend on the wrapping and scroll
+/// bounds of the new selection, and it can arrive in the next packet before a frame is drawn.
 fn dispatch_keys(
     area: Rect,
     app: &mut App,
     content: &Portfolio,
     keys: Vec<crossterm::event::KeyEvent>,
 ) {
-    let mut keys = keys.into_iter().peekable();
-    while let Some(key) = keys.next() {
+    for key in keys {
         app.handle_key(key);
         if app.quit {
             break;
         }
-        if keys.peek().is_some() {
-            // A following key may depend on wrapping/scroll bounds of the new selection.
-            ui::relayout(app, content, area.width, area.height);
-        }
+        ui::relayout(app, content, area.width, area.height);
     }
 }
 
@@ -1170,6 +1169,8 @@ async fn run_portfolio(
                     new_terminal.backend_mut().write_all(&prefix)?;
                     terminal = Some(new_terminal);
                     area = size;
+                    // Keys that arrive before the next frame act on the new size's layout.
+                    ui::relayout(&mut app, content, area.width, area.height);
                     *entered = true;
                     pacer.changed();
                 }
@@ -1570,6 +1571,57 @@ mod tests {
             .draw(|frame| ui::draw(frame, &mut app, &content))
             .unwrap();
         assert!(terminal.backend_mut().writer_mut().len() < 65536);
+    }
+
+    /// Runs `packets` through the per-packet input path and returns the final page, focus and
+    /// scroll. With `draw_between`, a frame follows every packet; without, packets arrive inside
+    /// one frame interval, as they do when the frame pacer holds the next frame back.
+    fn run_packets(
+        content: &Portfolio,
+        packets: &[&[u8]],
+        draw_between: bool,
+    ) -> (Page, Option<usize>, usize) {
+        let area = dimensions(80, 24);
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(Vec::new()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        let mut app = App::default();
+        let mut decoder = Decoder::default();
+        render_frame(&mut terminal, &mut app, content, true).unwrap();
+        for packet in packets {
+            let keys = packet_keys(&mut decoder, packet);
+            dispatch_keys(area, &mut app, content, keys);
+            if draw_between {
+                render_frame(&mut terminal, &mut app, content, true).unwrap();
+            }
+        }
+        render_frame(&mut terminal, &mut app, content, true).unwrap();
+        (app.page, app.focus, app.scroll)
+    }
+
+    #[test]
+    fn keys_in_separate_packets_between_frames_act_on_the_current_layout() {
+        let content = Portfolio::bundled().unwrap();
+        let cases: [&[&[u8]]; 5] = [
+            &[b"p", b"j"],
+            &[b"p", b"j", b"j"],
+            &[b"w", b"\t", b"\t"],
+            &[b"t", b"\r"],
+            &[b"p", b"G", b"k"],
+        ];
+        for packets in cases {
+            assert_eq!(
+                run_packets(&content, packets, false),
+                run_packets(&content, packets, true),
+                "{packets:?}"
+            );
+        }
+        let (page, focus, _) = run_packets(&content, &[b"p", b"j"], false);
+        assert_eq!((page, focus), (Page::Projects, Some(1)));
     }
 
     #[test]
