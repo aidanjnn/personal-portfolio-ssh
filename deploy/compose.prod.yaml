@@ -64,6 +64,18 @@ services:
       - host-key:/data
     networks:
       - ssh
+    # Same check as the Dockerfile's HEALTHCHECK, stated here so the rollout
+    # gate (up --wait) never depends on image metadata. It is a real SSH key
+    # exchange against the container's own port, using only what the runtime
+    # image has: sh, grep and ssh-keyscan from openssh-client. start_interval
+    # lets --wait see "healthy" seconds after start instead of after 30 s.
+    healthcheck:
+      test: ["CMD-SHELL", "ssh-keyscan -T 3 -p 2222 -t ed25519 127.0.0.1 2>/dev/null | grep -q ssh-ed25519"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
     stop_grace_period: 10s
     cpus: 0.5
     mem_limit: 256m

@@ -370,7 +370,7 @@ ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml run --rm 
 | Action | How |
 | --- | --- |
 | Release | With CI green on `main`: `git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0` |
-| What CI does | If `ghcr.io/aidanjnn/personal-portfolio-ssh:<tag>` doesn't exist yet: runs `ci.yml` at the tag (fmt, clippy, `cargo test`, the SSH smoke suite) and, only if that passes, builds linux/amd64 and pushes `:<tag>` and `:latest`. If it already exists: no tests, no build; `docker buildx imagetools create` points `:latest` at it. Either way the image's **digest** is what gets deployed. If `DEPLOY_ENABLED` is `true`, joins the tailnet as `tag:ci` and, over Tailscale SSH as `deploy`, pulls and starts `ghcr.io/...@sha256:<digest>`. Then `ssh-keyscan` on `PUBLIC_HOST` ports 2222 and 22 must return an ed25519 key (and the expected fingerprint, if set) |
+| What CI does | If `ghcr.io/aidanjnn/personal-portfolio-ssh:<tag>` doesn't exist yet: runs `ci.yml` at the tag (fmt, clippy, `cargo test`, the SSH smoke suite) and, only if that passes, builds linux/amd64 and pushes `:<tag>` and `:latest`. If it already exists: no tests, no build; `docker buildx imagetools create` points `:latest` at it. Either way the image's **digest** is what gets deployed. If `DEPLOY_ENABLED` is `true`, joins the tailnet as `tag:ci` and, over Tailscale SSH as `deploy`: records the image the `portfolio` container runs now (by digest, via `docker inspect`), pulls only `portfolio` at the new digest and runs `docker compose up -d --wait --wait-timeout 120 portfolio`. If it isn't healthy within 120 s, it restores the recorded image, again with `--wait`, and fails the job. Caddy is never touched. Then `ssh-keyscan` on `PUBLIC_HOST` ports 2222 and 22 must return an ed25519 key (and the expected fingerprint, if set) |
 | Redeploy a tag | Actions → Deploy → Run workflow → "Use workflow from" → Tags → the tag. Any branch is refused. The run uses the workflow file as it was at that tag |
 | Rollback | The same, with the previous tag. Its image already exists, so nothing is rebuilt: `:latest` moves back to it and the VM runs its digest. Then reconnect and compare the fingerprint |
 | Manual deploy or rollback | `ssh root@portfolio` then `cd /opt/portfolio && TAG=<tag> docker compose -f compose.prod.yaml pull portfolio && TAG=<tag> docker compose -f compose.prod.yaml up -d --wait portfolio`. `PORTFOLIO_IMAGE=ghcr.io/aidanjnn/personal-portfolio-ssh@sha256:<digest>` instead of `TAG` pins the exact image |
@@ -400,7 +400,7 @@ docker stats --no-stream
 free -m                                                        # 1 GiB RAM plus 1 GiB swap
 ```
 
-The health check proves an SSH key exchange, not a full session. `restart: unless-stopped` restarts exited containers (including after reboots and unattended upgrades) but not merely unhealthy ones.
+The health check (`ssh-keyscan` against the container's own port 2222, declared in both the Dockerfile and `compose.prod.yaml`) proves an SSH key exchange, not a full session. It is also the rollout gate: CI's `up --wait` succeeds only once it passes. `restart: unless-stopped` restarts exited containers (including after reboots and unattended upgrades) but not merely unhealthy ones.
 
 **Patching.** Mostly automatic:
 

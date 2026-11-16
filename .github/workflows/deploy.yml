@@ -201,26 +201,71 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Pull and restart on the VM
+      - name: Roll out, roll back if unhealthy
         run: |
           if [[ -z "$DEPLOY_HOST" ]]; then
             echo "::error::Repository variable DEPLOY_HOST is not set"
             exit 1
           fi
-          # Tailscale SSH: tailscaled on the VM answers port 22 on its tailnet
-          # address (OpenSSH is masked there). The tailnet authenticates both
-          # ends, so there is no client key, and accept-new only records the
-          # node's host key. If Tailscale SSH were off, this would reach the
-          # portfolio instead, which rejects exec, so the step fails safely.
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::No image digest from the image job"
             exit 1
           fi
           IMAGE_REF="$IMAGE@$DIGEST"
           echo "Deploying $TAG as $IMAGE_REF"
+          # Tailscale SSH: tailscaled on the VM answers port 22 on its tailnet
+          # address (OpenSSH is masked there). The tailnet authenticates both
+          # ends, so there is no client key, and accept-new only records the
+          # node's host key. If Tailscale SSH were off, this would reach the
+          # portfolio instead, which rejects exec, so the step fails safely.
+          #
+          # The script below runs on the VM. It touches only the portfolio
+          # service: Caddy keeps running whatever happens.
           ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
-            "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "cd /opt/portfolio && export PORTFOLIO_IMAGE=${IMAGE_REF} && docker compose -f compose.prod.yaml pull portfolio && docker compose -f compose.prod.yaml up -d portfolio"
+            "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s -- "$IMAGE_REF" <<'REMOTE'
+          set -euo pipefail
+          new=$1
+          repo=${new%@*}
+          cd /opt/portfolio
+          compose() { docker compose -f compose.prod.yaml "$@"; }
+
+          # Record what runs now, by digest if the image has one, so a rollback
+          # restores exactly that image even if its tag has moved since.
+          prev=""
+          id=$(compose ps -a -q portfolio)
+          if [[ -n "$id" ]]; then
+            image_id=$(docker inspect -f '{{.Image}}' "$id")
+            prev=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$image_id" \
+              | grep -m 1 "^$repo@sha256:" || true)
+            [[ -n "$prev" ]] || prev=$(docker inspect -f '{{.Config.Image}}' "$id")
+          fi
+          echo "current: ${prev:-none}"
+
+          export PORTFOLIO_IMAGE=$new
+          if ! compose pull --quiet portfolio; then
+            echo "::error::Could not pull $new; nothing was changed"
+            exit 1
+          fi
+          if compose up -d --wait --wait-timeout 120 portfolio; then
+            echo "healthy: $new"
+            exit 0
+          fi
+
+          echo "::error::$new did not become healthy within 120 s"
+          compose logs --no-color --tail 40 portfolio || true
+          if [[ -z "$prev" ]]; then
+            echo "::error::No previous release to roll back to"
+            exit 1
+          fi
+          echo "Rolling back to $prev"
+          export PORTFOLIO_IMAGE=$prev
+          if compose up -d --wait --wait-timeout 120 portfolio; then
+            echo "::error::Rolled back to $prev, which is healthy. The release failed."
+          else
+            echo "::error::The rollback to $prev is not healthy either. Check the VM."
+          fi
+          exit 1
+          REMOTE
 
       - name: Smoke test public SSH
         run: |
