@@ -107,16 +107,65 @@ Tailnet policy (merge into yours; replace a default allow-all rule):
 }
 ```
 
-GitHub settings, used only by the `deploy` job:
+### GitHub settings
+
+Variables and secrets used by the workflows:
 
 | Kind | Name | Value |
 | --- | --- | --- |
-| Variable | `DEPLOY_ENABLED` | `true` to roll out after each build. Leave unset until the VM and DNS are live |
-| Variable | `DEPLOY_HOST` | Tailnet hostname: `portfolio`, or the full `portfolio.<tailnet>.ts.net` if the short name doesn't resolve |
-| Variable | `DEPLOY_USER` | Optional, default `deploy` |
-| Variable | `PUBLIC_HOST` | Optional, default `ssh.aidanjeon.com`. Smoke-test target |
-| Variable | `HOST_KEY_FINGERPRINT` | Optional `SHA256:...`. The smoke test fails if the served key differs |
-| Secret | `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` | Tailscale OAuth client |
+| Repository variable | `DEPLOY_ENABLED` | `true` to roll out after each build and to run the uptime check. Leave unset until the VM and DNS are live |
+| Repository variable | `DEPLOY_HOST` | Tailnet hostname: `portfolio`, or the full `portfolio.<tailnet>.ts.net` if the short name doesn't resolve |
+| Repository variable | `DEPLOY_USER` | Optional, default `deploy` |
+| Repository variable | `PUBLIC_HOST` | Optional, default `ssh.aidanjeon.com`. Smoke-test target |
+| Repository variable | `HOST_KEY_FINGERPRINT` | Optional `SHA256:...`. The smoke test fails if the served key differs |
+| `production` environment secret | `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` | Tailscale OAuth client. Environment secrets, not repository secrets, so only the `deploy` job, running for a `v*` tag, can read them |
+
+The deploy workflow refuses to run from anything but a `v*` tag, but a workflow file can be edited on any branch, so the real gates are settings only the owner can change. Apply them once with the GitHub CLI (`gh auth login` first), from any directory:
+
+```sh
+repo=aidanjnn/personal-portfolio-ssh
+
+# 1. The production environment accepts deployments from v* tags only.
+gh api -X PUT "repos/$repo/environments/production" --input - <<'EOF'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+gh api -X POST "repos/$repo/environments/production/deployment-branch-policies" \
+  -f name='v*' -f type=tag
+
+# 2. The Tailscale OAuth client lives in that environment (prompts for each value),
+#    and the old repository-level copies go away.
+gh secret set TS_OAUTH_CLIENT_ID --env production --repo "$repo"
+gh secret set TS_OAUTH_SECRET --env production --repo "$repo"
+gh secret delete TS_OAUTH_CLIENT_ID --repo "$repo" 2>/dev/null || true
+gh secret delete TS_OAUTH_SECRET --repo "$repo" 2>/dev/null || true
+
+# 3. Only admins may create v* tags (a push of one triggers a deploy) ...
+gh api -X POST "repos/$repo/rulesets" --input - <<'EOF'
+{
+  "name": "release tags: admins create",
+  "target": "tag",
+  "enforcement": "active",
+  "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+  "rules": [{"type": "creation"}],
+  "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+}
+EOF
+# ... and nobody may move or delete one, so a tag always names the code it was cut from.
+gh api -X POST "repos/$repo/rulesets" --input - <<'EOF'
+{
+  "name": "release tags: immutable",
+  "target": "tag",
+  "enforcement": "active",
+  "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+  "rules": [{"type": "update"}, {"type": "deletion"}, {"type": "non_fast_forward"}],
+  "bypass_actors": []
+}
+EOF
+```
+
+Check with `gh api "repos/$repo/environments/production/deployment-branch-policies"` (one policy, `v*`, type `tag`) and `gh api "repos/$repo/rulesets"` (both rulesets, `active`). Actor `5` is the built-in admin repository role. To retract a bad tag later, disable the immutable ruleset for that one deletion (`gh api -X PUT "repos/$repo/rulesets/<id>" -f enforcement=disabled`, then `active` again); prefer cutting a new tag.
+
+Optionally add yourself as a required reviewer on the environment (Settings → Environments → production) so each rollout waits for a click.
 
 ## Pick a region
 
@@ -322,7 +371,7 @@ ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml run --rm 
 | --- | --- |
 | Release | With CI green on `main`: `git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0` |
 | What CI does | Builds linux/amd64, pushes `:v0.1.0` and `:latest`. If `DEPLOY_ENABLED` is `true`, joins the tailnet as `tag:ci`, then over Tailscale SSH as `deploy` runs `cd /opt/portfolio && TAG=v0.1.0 docker compose -f compose.prod.yaml pull && ... up -d`. Then `ssh-keyscan` on `PUBLIC_HOST` ports 2222 and 22 must return an ed25519 key (and the expected fingerprint, if set) |
-| Rebuild/redeploy a tag | Actions → Deploy → Run workflow → existing tag. This also moves `:latest` to it |
+| Redeploy a tag | Actions → Deploy → Run workflow → "Use workflow from" → Tags → the tag. This also moves `:latest` to it. Any branch is refused |
 | Manual deploy | `ssh root@portfolio` then `cd /opt/portfolio && TAG=<tag> docker compose -f compose.prod.yaml pull && TAG=<tag> docker compose -f compose.prod.yaml up -d` |
 | Change `deploy/` files | Re-run `deploy/azure.sh`. It keeps the running tag |
 | Rollback | `TAG=<previous> docker compose -f compose.prod.yaml up -d` (the old image is usually still local; `pull` first if not). Then reconnect and compare the fingerprint |

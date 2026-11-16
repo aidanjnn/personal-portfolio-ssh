@@ -5,10 +5,15 @@ name: Deploy
 # Azure VM over Tailscale SSH. Runbook: docs/DEPLOYMENT.md.
 # It never syncs deploy/: re-run deploy/azure.sh after changing those files.
 #
+# Runs only for v* tags: on a tag push, or from "Run workflow" with a v* tag
+# picked under "Use workflow from". Any other ref fails the first job. The
+# production environment is limited to v* tags as well, and a tag ruleset
+# protects them (docs/DEPLOYMENT.md, "GitHub settings").
+#
 # Repository variables: DEPLOY_ENABLED, DEPLOY_HOST (tailnet hostname),
 #   DEPLOY_USER (default deploy), PUBLIC_HOST (default ssh.aidanjeon.com),
 #   HOST_KEY_FINGERPRINT (optional, SHA256:...)
-# Secrets: TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET
+# production environment secrets: TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET
 #
 # Every action is pinned to a full commit SHA; the comment names its release.
 # To bump one, look up the new tag's commit (for an annotated tag, take the
@@ -19,12 +24,8 @@ on:
   push:
     tags:
       - "v*"
+  # Pick an existing v* tag under "Use workflow from". Also moves :latest to it.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing git tag to build and deploy, e.g. v0.1.0. Also moves :latest.
-        required: true
-        type: string
 
 permissions: {}
 
@@ -37,30 +38,43 @@ env:
   IMAGE: ghcr.io/aidanjnn/personal-portfolio-ssh
 
 jobs:
-  build:
-    name: Build and push image
+  resolve:
+    name: Resolve tag
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 5
+    permissions: {}
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Resolve tag
+      - name: Refuse anything but a v* tag
         id: tag
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          # workflow_dispatch can start from any branch; only release tags deploy.
+          if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::Run this workflow from a v* tag (Use workflow from → Tags), not $GITHUB_REF"
+            exit 1
+          fi
           # The tag ends up in an image reference and a remote shell command.
+          TAG=$GITHUB_REF_NAME
           if [[ ! "$TAG" =~ ^v[0-9A-Za-z._-]+$ ]]; then
             echo "::error::Tag '$TAG' must start with v and contain only [0-9A-Za-z._-]"
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+  build:
+    name: Build and push image
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ needs.resolve.outputs.tag }}
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ steps.tag.outputs.tag }}
           persist-credentials: false
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -77,11 +91,11 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
             ${{ env.IMAGE }}:latest
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.tag.outputs.tag }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -90,7 +104,10 @@ jobs:
     needs: build
     if: vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions: {}
+    # Limited to v* tags in the repository settings. TS_OAUTH_* below are this
+    # environment's secrets, so no other job or ref can read them.
     environment:
       name: production
       url: https://aidanjeon.com
