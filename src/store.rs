@@ -522,6 +522,53 @@ mod tests {
         agent(timeout, false)
     }
 
+    /// A proxy for the child process below; nothing listens on the discard port.
+    const PROXY_ENV: (&str, &str) = ("ALL_PROXY", "http://127.0.0.1:9");
+
+    fn assert_no_proxy_or_redirects() {
+        for https_only in [true, false] {
+            let agent = agent(FETCH_TIMEOUT, https_only);
+            let config = agent.config();
+            assert!(config.proxy().is_none(), "the fetch agent uses a proxy");
+            assert_eq!(
+                config.max_redirects(),
+                0,
+                "the fetch agent follows redirects"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "run by fetch_agent_uses_no_proxy_and_follows_no_redirects, with a proxy set"]
+    fn fetch_agent_config_with_a_proxy_in_the_environment() {
+        assert_eq!(std::env::var(PROXY_ENV.0).as_deref(), Ok(PROXY_ENV.1));
+        assert_no_proxy_or_redirects();
+    }
+
+    #[test]
+    fn fetch_agent_uses_no_proxy_and_follows_no_redirects() {
+        assert_no_proxy_or_redirects();
+        // ureq takes its default proxy from ALL_PROXY and friends when it builds a config, so
+        // check again with one set. Setting it here would race other tests reading the
+        // environment, so a child process runs the check.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::fetch_agent_config_with_a_proxy_in_the_environment",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(PROXY_ENV.0, PROXY_ENV.1)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn fetch_returns_a_good_body() {
         let body = updated_json();
