@@ -101,12 +101,16 @@ jobs:
             # GHCR answers DENIED, not "not found", while the package has no
             # image at all (the first release). The packages API tells the two
             # apart: 404 means there is no package yet, so nothing to reuse.
+            # GitHub documents that API for classic tokens only, so GITHUB_TOKEN
+            # may get 403 instead. Treating 403 as "no package" is safe: if a
+            # package existed that this repo cannot read, the push in the image
+            # job would be denied too, so an existing tag is never overwritten.
             if api=$(gh api "users/${package%%/*}/packages/container/${package#*/}" --jq .name 2>&1); then
               echo "::error::Package $package exists, but reading $REF was denied"
               printf '%s\n' "$out"
               exit 1
-            elif grep -q 'HTTP 404' <<<"$api"; then
-              echo "Package $package does not exist yet: testing and building $REF"
+            elif grep -Eq 'HTTP 40[34]' <<<"$api"; then
+              echo "No readable package $package yet: testing and building $REF"
               echo "exists=false" >> "$GITHUB_OUTPUT"
             else
               echo "::error::Could not check $REF, or whether package $package exists"
@@ -331,20 +335,21 @@ jobs:
               sleep 3
             done
             if [[ -z "$key" ]]; then
-              echo "::error::No ed25519 host key from $PUBLIC_HOST:$port"
+              echo "::error::No ed25519 host key from $PUBLIC_HOST:$port. The rollout was healthy, so the VM now serves this release while :latest stays on the previous one. Check DNS and the NSG, then re-run this workflow or roll back."
               exit 1
             fi
             fp=$(ssh-keygen -lf - <<<"$key" | awk '{print $2}')
             echo "$PUBLIC_HOST:$port serves ed25519 $fp"
             if [[ -n "$EXPECTED_FINGERPRINT" && "$fp" != "$EXPECTED_FINGERPRINT" ]]; then
-              echo "::error::Host key changed on port $port: expected $EXPECTED_FINGERPRINT, got $fp"
+              echo "::error::Host key changed on port $port: expected $EXPECTED_FINGERPRINT, got $fp. The VM serves this release; :latest stays on the previous one."
               exit 1
             fi
           done
 
   # :latest is the last healthy release. It moves only after the rollout passed
   # its health gate, or, with deploys off, once the image is built or found.
-  # A failed or rolled-back deploy leaves it where it was.
+  # A failed or rolled-back deploy leaves it where it was. If only the public
+  # smoke test fails, the VM keeps the new, healthy release and :latest lags it.
   promote:
     name: Move :latest
     needs: [resolve, image, deploy]
