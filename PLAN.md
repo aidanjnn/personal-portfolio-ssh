@@ -34,8 +34,8 @@ The host is an Azure VM on Azure for Students: `Standard_B2ats_v2`, Ubuntu 24.04
 - [x] 1c. Server refreshes content from the website (≤ 1/min, 2 s timeout, last good copy, bundled fallback).
 - [x] 2. Page design renderer, focus, sheets, themes, compact layout and birds.
 - [x] 3. Hardening: 3 connections per IP, 30-minute hard limit, goodbye line, connect logs without IPs, decoder fuzz test.
-- [x] 4. Deploy files: production compose, Caddyfile, Azure provisioning script (`deploy/azure.sh`), unattended bootstrap, fingerprint script, GHCR deploy workflow.
-- [ ] 5. Provision the Azure VM with `deploy/azure.sh` and do the DNS cutover at Namecheap (apex A and a new `ssh` A record only). **Owner action**: needs Azure for Students, Tailscale, and Namecheap access.
+- [x] 4. Deploy files: production compose, Caddyfile, Azure provisioning script (`deploy/azure.sh`), unattended bootstrap, fingerprint script, per-IP connection-rate limit, GHCR deploy workflow (tests first, digest deploys, health-gated rollout with automatic rollback), uptime workflow.
+- [ ] 5. Apply the GitHub settings (`production` environment limited to `v*` tags, its Tailscale secrets, `v*` tag rulesets), provision the Azure VM with `deploy/azure.sh` and do the DNS cutover at Namecheap (apex A and a new `ssh` A record only). **Owner action**: needs GitHub admin, Azure for Students, Tailscale, and Namecheap access.
 - [ ] 6. Launch: change the site's "A TUI portfolio is coming!" line to `ssh aidanjeon.com`, publish the host-key fingerprint, record a demo.
 
 ## Launch checks

@@ -1,8 +1,10 @@
 name: Deploy
 
-# Builds the linux/amd64 image for a release tag, pushes it to GHCR, and,
-# when the DEPLOY_ENABLED repository variable is 'true', rolls it out to the
-# Azure VM over Tailscale SSH. Runbook: docs/DEPLOYMENT.md.
+# For a release tag: runs ci.yml, builds the linux/amd64 image and pushes it to
+# GHCR (or, if the tag's image already exists, reuses it without testing or
+# building), then, when the DEPLOY_ENABLED repository variable is 'true',
+# rolls its digest out to the Azure VM over Tailscale SSH, rolling back if it
+# doesn't become healthy. Runbook: docs/DEPLOYMENT.md.
 # It never syncs deploy/: re-run deploy/azure.sh after changing those files.
 #
 # Runs only for v* tags: on a tag push, or from "Run workflow" with a v* tag

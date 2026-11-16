@@ -2,7 +2,7 @@
 
 The portfolio is an application served over SSH. A visitor's SSH session opens the portfolio and never a system shell. This runbook takes it from a local container to `ssh aidanjeon.com` on one small Azure VM, paid for by an Azure for Students subscription.
 
-**Status:** prepared, not executed. No Azure resource, DNS record, tailnet or registry package exists yet. The files live in [`deploy/`](../deploy) and [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml). They have only been checked locally (`bash -n`, `docker compose config`, `deploy/azure.sh --dry-run`).
+**Status:** prepared, not executed. No Azure resource, DNS record, tailnet or registry package exists yet. The files live in [`deploy/`](../deploy), [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) and [`.github/workflows/uptime.yml`](../.github/workflows/uptime.yml). They have only been checked locally (`bash -n`, `shellcheck -x`, `actionlint`, `docker compose config`, `deploy/azure.sh --dry-run`). Before the first deploy, apply the [GitHub settings](#github-settings).
 
 > **App flags.** `deploy/compose.prod.yaml` passes `--max-per-ip`, `--max-session-secs` and `--content-url`. The first release you deploy must support them, or the container exits on start. Check with `docker run --rm ghcr.io/aidanjnn/personal-portfolio-ssh:<tag> --help`. `--content-url` also needs outbound HTTPS and trusted CA roots inside the image.
 
