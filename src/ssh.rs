@@ -36,8 +36,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// channel's exit status, EOF and close, the SSH disconnect, and russh winding down.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const ESCAPE_TIMEOUT: Duration = Duration::from_millis(80);
-/// Keys applied from one input packet.
-const MAX_KEYS: usize = 32;
 /// Slack after the session deadline before the connection itself is dropped.
 const DEADLINE_GRACE: Duration = Duration::from_secs(10);
 /// How long a stopping server waits for each portfolio to say goodbye before disconnecting.
@@ -1074,11 +1072,12 @@ impl server::Handler for Visitor {
     // All direct/forwarded TCP, Unix socket, and X11 channel opens use russh's rejecting defaults.
 }
 
-/// The keys one input packet applies. A paste longer than `MAX_KEYS` keeps its first keys
-/// and silently drops the rest; the session carries on. The whole packet (at most russh's
-/// `maximum_packet_size`) still passes through the decoder so a long bracketed paste ends.
+/// The keys one input packet may apply: no more than the key budget can ever hold. A paste
+/// longer than `KEY_BURST` keeps its first keys and silently drops the rest; the session
+/// carries on. The whole packet (at most russh's `maximum_packet_size`) still passes through
+/// the decoder so a long bracketed paste ends.
 fn packet_keys(decoder: &mut Decoder, data: &[u8]) -> Vec<crossterm::event::KeyEvent> {
-    decoder.feed_up_to(data, MAX_KEYS)
+    decoder.feed_up_to(data, KEY_BURST)
 }
 
 /// Applies a packet's keys. Each key only updates state and layout; the caller renders at most
@@ -1347,9 +1346,10 @@ impl Bucket {
 }
 
 /// Keys a session may apply: a held-down key repeats at roughly 30 per second, so 60 per
-/// second with a burst of 30 never drops typing, only floods.
+/// second with a burst of 32 never drops typing, only floods. The burst is also the most keys
+/// one packet applies, since the budget could never admit more of them at once.
 const KEYS_PER_SECOND: f64 = 60.0;
-const KEY_BURST: f64 = 30.0;
+const KEY_BURST: usize = 32;
 /// Input a session may send, in bytes: 64 KiB a second after a burst of 256 KiB. Keys are a
 /// few bytes each, so this only binds input that yields none (bracketed pastes, NULs, invalid
 /// UTF-8, unknown escapes), which the key budget alone would let through unmetered.
@@ -1380,7 +1380,7 @@ struct Pacer {
 impl Pacer {
     fn new(now: Instant) -> Self {
         Self {
-            keys: Bucket::full(KEYS_PER_SECOND, KEY_BURST, now),
+            keys: Bucket::full(KEYS_PER_SECOND, KEY_BURST as f64, now),
             bytes: Bucket::full(INPUT_BYTES_PER_SECOND, INPUT_BYTE_BURST, now),
             dirty: false,
             next_frame: now,
@@ -1854,7 +1854,7 @@ mod tests {
                 .is_empty()
         );
         let keys = Decoder::default().feed(&b"pjjjjkkkkwjjjjkkkkthjjjjdjjkkkkj"[..]);
-        assert_eq!(keys.len(), MAX_KEYS);
+        assert_eq!(keys.len(), KEY_BURST);
         let frames = terminal.get_frame().count();
         let area = terminal.get_frame().area();
         dispatch_keys(area, &mut app, &content, keys);
@@ -1879,7 +1879,7 @@ mod tests {
         let mut paste = vec![b'j'; 40000];
         paste.push(b'q');
         let keys = packet_keys(&mut decoder, &paste);
-        assert_eq!(keys.len(), MAX_KEYS);
+        assert_eq!(keys.len(), KEY_BURST);
         dispatch_keys(dimensions(80, 24), &mut app, &content, keys);
         assert!(!app.quit, "keys past the cap must be dropped, not applied");
         let keys = packet_keys(&mut decoder, b"t");
@@ -2414,7 +2414,7 @@ mod tests {
             let mut keys =
                 vec![
                     crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j'));
-                    MAX_KEYS
+                    KEY_BURST
                 ];
             pacer.admit(now, &mut keys);
             if !keys.is_empty() {
@@ -2426,7 +2426,7 @@ mod tests {
                 pacer.drew(now);
             }
         }
-        let burst = KEY_BURST as usize;
+        let burst = KEY_BURST;
         let refill = KEYS_PER_SECOND as usize;
         assert!(
             (burst + refill - 2..=burst + refill).contains(&applied),
@@ -2436,7 +2436,7 @@ mod tests {
         // Out of budget, input is left unread until the next whole key.
         let mut fresh = Pacer::new(start);
         let mut keys =
-            vec![crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')); MAX_KEYS];
+            vec![crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')); KEY_BURST];
         fresh.admit(start, &mut keys);
         assert!(!fresh.ready(start));
         let next = fresh.next_read();
@@ -2509,7 +2509,7 @@ mod tests {
         visit.read_until(ENTER).await;
         // Far more keys than the budget allows, all at once.
         for _ in 0..50 {
-            visit.send(&[b'j'; MAX_KEYS]).await;
+            visit.send(&[b'j'; KEY_BURST]).await;
         }
         // Once the budget refills, the next key applies at once: nothing queued before it.
         sleep(Duration::from_millis(1500)).await;
