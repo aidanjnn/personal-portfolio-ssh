@@ -44,7 +44,15 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const HANGUP_GRACE: Duration = Duration::from_secs(1);
 const RESTART_MESSAGE: &[u8] = b"\r\nthe portfolio is restarting, try again in a moment\r\n";
 /// How much longer than the portfolio's idle timer russh waits before dropping a connection.
-const TRANSPORT_IDLE_MARGIN: Duration = Duration::from_secs(10);
+/// Before the shell starts, the setup deadline is the real limit; after it, this only has
+/// to outlast the portfolio's goodbye, whose write is bounded by `CLOSE_TIMEOUT`.
+const TRANSPORT_IDLE_MARGIN: Duration = Duration::from_secs(5);
+/// From accept until the shell starts: version exchange, key exchange, authentication,
+/// channel and PTY. OpenSSH needs well under a second; 20 s allows for slow links.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Concurrent connections from one IPv6 /56 (a typical household or site), as a multiple
+/// of the per-/64 limit, so a client cannot multiply its share by hopping between /64s.
+const NETWORK_FACTOR: usize = 4;
 
 pub struct Config {
     pub bind: SocketAddr,
@@ -53,6 +61,8 @@ pub struct Config {
     pub max_per_ip: usize,
     pub idle_timeout: Duration,
     pub max_session: Duration,
+    /// Not a flag: tests shorten it.
+    pub setup_timeout: Duration,
     pub links: bool,
 }
 
@@ -65,6 +75,7 @@ impl Default for Config {
             max_per_ip: 3,
             idle_timeout: Duration::from_secs(300),
             max_session: Duration::from_secs(1800),
+            setup_timeout: SETUP_TIMEOUT,
             links: true,
         }
     }
@@ -142,6 +153,7 @@ async fn run_server(
                 let connection = Connection {
                     kill,
                     stage: stage_rx,
+                    setup_by: started + config.setup_timeout,
                     deadline,
                     shutdown: shutdown_rx.clone(),
                     record: Arc::clone(&record),
@@ -216,6 +228,8 @@ enum Stage {
 struct Connection {
     kill: Kill,
     stage: watch::Receiver<Stage>,
+    /// When the shell must have started.
+    setup_by: Instant,
     deadline: Instant,
     /// Becomes true when the server is stopping.
     shutdown: watch::Receiver<bool>,
@@ -223,12 +237,19 @@ struct Connection {
 }
 
 impl Connection {
-    /// Returns within a bounded time of the portfolio ending, the server stopping, or the
-    /// session deadline, whatever the client does.
+    /// Returns within a bounded time of the setup deadline passing before the shell starts,
+    /// the portfolio ending, the server stopping, or the session deadline, whatever the
+    /// client does.
     async fn run(mut self, ssh_config: Arc<server::Config>, stream: TcpStream, handler: Visitor) {
+        let setup = sleep_until(self.setup_by);
+        tokio::pin!(setup);
         let mut running = tokio::select! {
-            result = timeout(Duration::from_secs(10), server::run_stream(ssh_config, stream, handler)) => {
-                match result { Ok(Ok(running)) => running, _ => return }
+            result = server::run_stream(ssh_config, stream, handler) => {
+                match result { Ok(running) => running, Err(_) => return }
+            }
+            () = &mut setup => {
+                self.record.lock().unwrap_or_else(PoisonError::into_inner).reason = Some(Reason::Setup);
+                return;
             }
             _ = self.shutdown.wait_for(|stopping| *stopping) => return,
         };
@@ -236,18 +257,31 @@ impl Connection {
         let message = loop {
             tokio::select! {
                 _ = &mut running => return,
+                // Key exchange, authentication, channel, PTY and shell share one deadline,
+                // however the client paces them or keeps the transport alive meanwhile.
+                // No polite disconnect: russh holds it back during key exchange, and a
+                // client that has not reached the shell by now has nothing on screen to keep.
+                () = &mut setup, if *self.stage.borrow() == Stage::Setup => {
+                    self.record.lock().unwrap_or_else(PoisonError::into_inner).reason = Some(Reason::Setup);
+                    break None;
+                }
                 changed = self.stage.changed() => {
                     if changed.is_err() || *self.stage.borrow() == Stage::Ended {
-                        break "Portfolio session ended";
+                        break Some("Portfolio session ended");
                     }
                 }
-                _ = self.shutdown.wait_for(|stopping| *stopping) => break "Portfolio server stopping",
+                _ = self.shutdown.wait_for(|stopping| *stopping) => break Some("Portfolio server stopping"),
                 // Backstop for connections that never reach the portfolio's own deadline.
                 _ = sleep_until(self.deadline + DEADLINE_GRACE) => {
                     self.record.lock().unwrap_or_else(PoisonError::into_inner).reason.get_or_insert(Reason::Limit);
-                    break "Session time limit reached";
+                    break Some("Session time limit reached");
                 }
             }
+        };
+        let Some(message) = message else {
+            self.kill.now();
+            let _ = timeout(CLOSE_TIMEOUT, running).await;
+            return;
         };
         if *self.stage.borrow() == Stage::Shell {
             // The portfolio restores the visitor's screen and says goodbye; let it finish.
@@ -290,6 +324,8 @@ enum Reason {
     Limit,
     Restart,
     Closed,
+    /// The shell had not started by the setup deadline.
+    Setup,
     /// Rendering or writing a frame failed.
     Error,
     /// The portfolio task panicked.
@@ -304,6 +340,7 @@ impl Reason {
             Self::Limit => "limit",
             Self::Restart => "restart",
             Self::Closed => "closed",
+            Self::Setup => "setup",
             Self::Error => "error",
             Self::Panic => "panic",
         }
@@ -317,16 +354,20 @@ struct SessionRecord {
     reason: Option<Reason>,
 }
 
-/// Concurrent connections per client address, in memory only.
+/// Concurrent connections per client address, in memory only. IPv6 peers count against
+/// both their /64 (`max`) and their /56 (`max * NETWORK_FACTOR`).
 #[derive(Clone)]
 struct IpLimiter {
     max: usize,
-    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    counts: Arc<Mutex<HashMap<Prefix, usize>>>,
 }
+
+/// A counted address range: the network address and its prefix length.
+type Prefix = (IpAddr, u8);
 
 struct IpSlot {
     limiter: IpLimiter,
-    ip: IpAddr,
+    prefixes: Vec<Prefix>,
 }
 
 impl IpLimiter {
@@ -337,21 +378,30 @@ impl IpLimiter {
         }
     }
 
-    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<Prefix, usize>> {
         self.counts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn try_acquire(&self, ip: IpAddr) -> Option<IpSlot> {
-        let ip = bucket(ip);
+        let length = if ip.to_canonical().is_ipv4() { 32 } else { 64 };
+        let mut limits = vec![((bucket(ip), length), self.max)];
+        if let Some(network) = network(ip) {
+            limits.push(((network, 56), self.max * NETWORK_FACTOR));
+        }
         let mut counts = self.counts();
-        let count = counts.entry(ip).or_insert(0);
-        if *count >= self.max {
+        if limits
+            .iter()
+            .any(|(prefix, max)| counts.get(prefix).is_some_and(|count| count >= max))
+        {
             return None;
         }
-        *count += 1;
+        let prefixes: Vec<Prefix> = limits.into_iter().map(|(prefix, _)| prefix).collect();
+        for prefix in &prefixes {
+            *counts.entry(*prefix).or_insert(0) += 1;
+        }
         Some(IpSlot {
             limiter: self.clone(),
-            ip,
+            prefixes,
         })
     }
 }
@@ -365,12 +415,25 @@ fn bucket(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// An IPv6 peer's /56: ISPs commonly delegate one per customer, carved into /64s.
+fn network(ip: IpAddr) -> Option<IpAddr> {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => Some(IpAddr::V6(Ipv6Addr::from_bits(
+            v6.to_bits() & !(u128::MAX >> 56),
+        ))),
+        IpAddr::V4(_) => None,
+    }
+}
+
 impl Drop for IpSlot {
     fn drop(&mut self) {
-        if let Entry::Occupied(mut entry) = self.limiter.counts().entry(self.ip) {
-            *entry.get_mut() -= 1;
-            if *entry.get() == 0 {
-                entry.remove();
+        let mut counts = self.limiter.counts();
+        for prefix in &self.prefixes {
+            if let Entry::Occupied(mut entry) = counts.entry(*prefix) {
+                *entry.get_mut() -= 1;
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
             }
         }
     }
@@ -854,7 +917,7 @@ fn farewell(entered: bool, reason: Reason, web: &str) -> Vec<u8> {
         Reason::Limit => bytes.extend_from_slice(TIME_LIMIT_MESSAGE),
         Reason::Restart => bytes.extend_from_slice(RESTART_MESSAGE),
         Reason::Error | Reason::Panic => bytes.extend_from_slice(ERROR_MESSAGE),
-        Reason::Idle | Reason::Closed => {}
+        Reason::Idle | Reason::Closed | Reason::Setup => {}
     }
     bytes
 }
@@ -1258,6 +1321,96 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_peers_cannot_multiply_their_share_by_hopping_between_64s() {
+        let v6 = |text: &str| text.parse::<IpAddr>().unwrap();
+        let limiter = IpLimiter::new(1);
+        // Four /64s inside 2001:db8:0:100::/56 fill its share of 1 * NETWORK_FACTOR.
+        let held: Vec<_> = (0..NETWORK_FACTOR)
+            .map(|i| limiter.try_acquire(v6(&format!("2001:db8:0:1{i:02x}::1"))))
+            .collect::<Option<_>>()
+            .unwrap();
+        assert!(limiter.try_acquire(v6("2001:db8:0:1ff::1")).is_none());
+        let elsewhere = limiter.try_acquire(v6("2001:db8:0:200::1")).unwrap();
+        // IPv4 has no network share.
+        let v4: Vec<_> = (1..=8)
+            .map(|i| limiter.try_acquire(v6(&format!("192.0.2.{i}"))).unwrap())
+            .collect();
+        drop((held, elsewhere, v4));
+        assert!(limiter.counts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_shell_must_start_by_the_setup_deadline() {
+        let setup = Duration::from_secs(1);
+        let server = TestServer::start(Config {
+            setup_timeout: setup,
+            ..test_config()
+        })
+        .await;
+        // A version line, then silence.
+        let silent = async {
+            let mut stream = TcpStream::connect(server.addr).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"SSH-2.0-x\r\n")
+                .await
+                .unwrap();
+            let started = Instant::now();
+            let mut sink = Vec::new();
+            timeout(
+                Duration::from_secs(5),
+                tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut sink),
+            )
+            .await
+            .expect("pre-auth silence kept the connection open")
+            .ok();
+            started.elapsed()
+        };
+        // Authenticated with keepalives, which reset russh's own inactivity timer, but no channel.
+        let keepalive = async {
+            let config = Arc::new(russh::client::Config {
+                keepalive_interval: Some(Duration::from_millis(200)),
+                ..Default::default()
+            });
+            let mut handle = russh::client::connect(config, server.addr, TestClient)
+                .await
+                .unwrap();
+            assert!(handle.authenticate_none("visitor").await.unwrap().success());
+            let started = Instant::now();
+            timeout(Duration::from_secs(5), async {
+                while !handle.is_closed() {
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("a channel-less connection outlived the setup deadline");
+            started.elapsed()
+        };
+        // A shell without a PTY is refused; the connection must not linger afterwards.
+        let no_pty = async {
+            let mut visit = Visit::open(server.addr, false).await;
+            visit.wait_closed(Duration::from_secs(5)).await
+        };
+        let (silent, keepalive, no_pty) = tokio::join!(silent, keepalive, no_pty);
+        for (case, elapsed) in [
+            ("silent", silent),
+            ("keepalive", keepalive),
+            ("no PTY", no_pty),
+        ] {
+            assert!(
+                elapsed < setup + Duration::from_secs(1),
+                "{case}: {elapsed:?}"
+            );
+        }
+        // A real visitor takes far less than the deadline and is not cut off by it.
+        let mut visit = Visit::open(server.addr, true).await;
+        visit.read_until(ENTER).await;
+        sleep(setup + Duration::from_millis(500)).await;
+        visit.output.clear();
+        visit.send(b"w").await;
+        visit.read_until(b"Copperlane").await;
+        server.stop().await;
+    }
+
+    #[test]
     fn the_portfolio_idle_timer_always_beats_the_transport_timer() {
         let key =
             russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
@@ -1265,7 +1418,8 @@ mod tests {
         for secs in [1, 300, 3600] {
             let idle = Duration::from_secs(secs);
             let transport = ssh_config(key.clone(), idle).inactivity_timeout.unwrap();
-            assert!(transport >= idle + Duration::from_secs(10), "{secs}s");
+            // Room for the goodbye after the portfolio's own idle timer fires.
+            assert!(transport >= idle + 2 * CLOSE_TIMEOUT, "{secs}s");
         }
     }
 
