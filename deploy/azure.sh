@@ -31,7 +31,7 @@ readonly ADMIN_USER=azureuser
 readonly DEFAULT_LOCATION=canadacentral
 readonly FALLBACK_LOCATION=westus2
 readonly PUBLIC_TCP_PORTS="22 2222 80 443"
-readonly DEPLOY_FILES="bootstrap.sh compose.prod.yaml Caddyfile fingerprint.sh"
+readonly DEPLOY_FILES="bootstrap.sh compose.prod.yaml Caddyfile fingerprint.sh ratelimit.sh"
 DEPLOY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly DEPLOY_DIR
 

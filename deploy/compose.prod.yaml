@@ -36,6 +36,7 @@ services:
       - 0.0.0.0:2222
       - --host-key
       - /data/ssh_host_ed25519_key
+      # 32 sessions of a few MiB each fit the 256 MiB cap below on a 1 GiB VM.
       - --max-sessions
       - "32"
       - --max-per-ip

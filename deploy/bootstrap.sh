@@ -16,9 +16,10 @@
 #   START_STACK  1 (default) starts the stack. 0 installs everything but
 #                leaves it stopped, e.g. to restore a host key backup first.
 #
-# It installs Docker Engine and Tailscale, joins the tailnet with Tailscale
-# SSH, disables OpenSSH so the portfolio can own port 22, creates the `deploy`
-# user for CI, installs the stack into /opt/portfolio and starts it.
+# It installs Docker Engine (with a pinned daemon.json) and Tailscale, adds a
+# per-address connection-rate limit, joins the tailnet with Tailscale SSH,
+# disables OpenSSH so the portfolio can own port 22, creates the `deploy` user
+# for CI, installs the stack into /opt/portfolio and starts it.
 # On success the last line is `BOOTSTRAP_OK stack=started|held`.
 
 set -euo pipefail
@@ -44,6 +45,22 @@ log() { printf '\n==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 apt_get() { apt-get -o DPkg::Lock::Timeout=300 -y -q "$@"; }
 compose() { docker compose -f "${APP_DIR}/compose.prod.yaml" "$@"; }
+# Write stdin to a file only if its content differs. Sets changed=1 if it did.
+put() { # mode dst
+  local tmp
+  tmp=$(mktemp)
+  cat >"${tmp}"
+  if [[ -f $2 ]] && cmp -s "${tmp}" "$2"; then
+    changed=0
+    echo "unchanged: $2"
+  else
+    install -D -m "$1" "${tmp}" "$2"
+    changed=1
+    echo "installed: $2"
+  fi
+  rm -f "${tmp}"
+}
+install_file() { put "$1" "$3" <"$2"; } # mode src dst
 
 # --- Preflight ----------------------------------------------------------------
 
@@ -59,7 +76,7 @@ CODENAME=${UBUNTU_CODENAME:-${VERSION_CODENAME}}
 # The image is built for linux/amd64 only.
 [[ $(dpkg --print-architecture) == amd64 ]] || die "expected an amd64 host"
 
-for f in compose.prod.yaml Caddyfile fingerprint.sh; do
+for f in compose.prod.yaml Caddyfile fingerprint.sh ratelimit.sh; do
   [[ -f ${SCRIPT_DIR}/${f} ]] || die "missing ${SCRIPT_DIR}/${f}; copy the whole deploy/ directory"
 done
 
@@ -114,7 +131,67 @@ apt_get update
 apt_get install \
   docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
   tailscale
+
+# --- Docker daemon settings ----------------------------------------------------
+# Pinned instead of left to Docker's defaults, which can change:
+#   iptables        Published ports are DNATed by iptables, so a visitor's real
+#                   source address survives into the container, and
+#                   --max-per-ip counts by that address. With iptables off,
+#                   docker-proxy would accept every connection itself and the
+#                   portfolio would see one address (the bridge gateway) for
+#                   everyone: all visitors would share 3 slots. The DOCKER-USER
+#                   rate limit below needs it too. Never turn it off.
+#   userland-proxy  docker-proxy then carries only connections made on the host
+#                   itself (fingerprint.sh's keyscan of 127.0.0.1:2222), and the
+#                   port 22 check below expects it to hold the port.
+#   live-restore    Containers keep running while dockerd restarts, e.g. when
+#                   apt upgrades docker-ce, so visitors are not dropped.
+#   log-*           Defaults for containers that set no logging of their own.
+log "Configuring the Docker daemon"
+put 0644 /etc/docker/daemon.json <<'EOF'
+{
+  "iptables": true,
+  "userland-proxy": true,
+  "live-restore": true,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOF
+daemon_changed=${changed}
+dockerd --validate --config-file /etc/docker/daemon.json
 systemctl enable --now docker tailscaled
+# The package starts dockerd before the file exists on a first run. With
+# live-restore already on, a restart leaves running containers alone.
+if [[ ${daemon_changed} == 1 ]]; then
+  systemctl restart docker
+fi
+
+# --- Connection-rate limit -----------------------------------------------------
+# iptables hashlimit in DOCKER-USER, re-applied after every docker start.
+# The numbers are explained in deploy/ratelimit.sh.
+log "Rate-limiting new SSH connections per source address"
+install_file 0755 "${SCRIPT_DIR}/ratelimit.sh" /usr/local/sbin/portfolio-ratelimit
+put 0644 /etc/systemd/system/portfolio-ratelimit.service <<'EOF'
+[Unit]
+Description=Per-address rate limit for new connections to the portfolio's SSH ports
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/portfolio-ratelimit
+
+[Install]
+WantedBy=docker.service
+EOF
+systemctl daemon-reload
+systemctl enable portfolio-ratelimit.service
+systemctl restart portfolio-ratelimit.service
 
 # --- Tailnet -------------------------------------------------------------------
 # Admin access goes only over the tailnet, through Tailscale SSH. tailscaled
@@ -160,7 +237,8 @@ fi
 # ufw would add nothing. Docker's published ports bypass it, and with OpenSSH
 # off nothing else listens publicly (tailscaled's UDP port is meant to be
 # reachable). A second rule set to keep in step is only a way to get it wrong,
-# so ufw stays off.
+# so ufw stays off. The one host rule is the rate limit above, which admits
+# everything the NSG admits, only slower for a flooding address.
 
 if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
   log "Disabling ufw (the NSG is the firewall)"
@@ -197,14 +275,6 @@ usermod -aG docker "${DEPLOY_USER}"
 
 log "Installing the stack into ${APP_DIR}"
 install -d -m 0755 "${APP_DIR}"
-install_file() { # mode src dst
-  if [[ -f $3 ]] && cmp -s "$2" "$3"; then
-    echo "unchanged: $3"
-  else
-    install -m "$1" "$2" "$3"
-    echo "installed: $3"
-  fi
-}
 install_file 0644 "${SCRIPT_DIR}/compose.prod.yaml" "${APP_DIR}/compose.prod.yaml"
 install_file 0644 "${SCRIPT_DIR}/Caddyfile" "${APP_DIR}/Caddyfile"
 install_file 0755 "${SCRIPT_DIR}/fingerprint.sh" "${APP_DIR}/fingerprint.sh"

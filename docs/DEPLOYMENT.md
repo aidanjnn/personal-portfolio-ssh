@@ -32,10 +32,11 @@ x64, not Arm: the image is built for linux/amd64 only.
 | File | On the VM | Purpose |
 | --- | --- | --- |
 | `deploy/azure.sh` | runs on your laptop | Creates the Azure resources, runs bootstrap over run-command, then opens the NSG |
-| `deploy/bootstrap.sh` | sent by `azure.sh` | Docker, Tailscale (joins with `--ssh`), OpenSSH masked, `deploy` user, `/opt/portfolio`, starts the stack |
+| `deploy/bootstrap.sh` | sent by `azure.sh` | Docker (pinned `/etc/docker/daemon.json`), rate limit, Tailscale (joins with `--ssh`), OpenSSH masked, `deploy` user, `/opt/portfolio`, starts the stack |
 | `deploy/compose.prod.yaml` | `/opt/portfolio/compose.prod.yaml` | `portfolio` and `caddy` services, hardened |
 | `deploy/Caddyfile` | `/opt/portfolio/Caddyfile` | Apex and `ssh.` redirects, automatic Let's Encrypt, HTTP/1.1 and HTTP/2 only |
 | `deploy/fingerprint.sh` | `/opt/portfolio/fingerprint.sh` | Prints the host-key fingerprint to publish |
+| `deploy/ratelimit.sh` | `/usr/local/sbin/portfolio-ratelimit` | Per-address connection-rate limit in `DOCKER-USER`, run by `portfolio-ratelimit.service` after every docker start |
 | `.github/workflows/deploy.yml` | GitHub Actions | Builds/pushes the image on `v*` tags; optional rollout over Tailscale SSH |
 
 **Volumes.** The compose project is named `portfolio`, so volumes are `portfolio_host-key` (the SSH identity), `portfolio_caddy-data` (certificates) and `portfolio_caddy-config`. **Never run `docker compose down -v`.**
@@ -43,6 +44,10 @@ x64, not Arm: the image is built for linux/amd64 only.
 **Hardening, both services:** read-only root filesystem, `cap_drop: ALL` (Caddy gets back only `NET_BIND_SERVICE`), `no-new-privileges`, `init`, CPU/memory/PID limits, `json-file` logs capped at 3 × 1 MB, `restart: unless-stopped`. The portfolio runs as UID 10001.
 
 **Perimeter.** The NSG is the firewall. It starts with Azure's default rules only, so nothing from the Internet gets in while bootstrap runs. The allow rule is added only after bootstrap reports success. There is no host firewall: Docker's published ports bypass ufw, and with OpenSSH off nothing else listens publicly, so ufw would only be a second list to keep in step. The NSG admits no UDP, so Caddy does not offer HTTP/3.
+
+**Rate limit.** The NSG cannot rate-limit, so `portfolio-ratelimit.service` adds an iptables `hashlimit` rule to Docker's `DOCKER-USER` chain: new TCP connections to ports 22 and 2222 get a shared bucket per source address of 20 back-to-back, refilled at 10 a minute. A flood's extra SYNs are dropped; people never get near it. The unit runs after every docker start, so the rule survives reboots and daemon restarts. Check it with `iptables -L PORTFOLIO-RATE -nv` on the VM. `--max-per-ip 3` separately caps concurrent sessions per address.
+
+**Real source addresses.** Both limits count by the visitor's IP, which only works while it survives Docker's DNAT into the container. `bootstrap.sh` pins this in `/etc/docker/daemon.json`: `"iptables": true` (DNAT keeps the source; with it off, docker-proxy would accept every connection and the container would see the bridge gateway for everyone, so all visitors would share 3 slots), `"userland-proxy": true` (only host-local connections go through docker-proxy), `"live-restore": true` (dockerd restarts don't stop containers), and log defaults. Docker restarts only when the file changes. Visitors behind one shared NAT, such as a campus, office or carrier-grade NAT, really do share one address, so they share 3 sessions and one rate bucket.
 
 **Admin access.** Only Tailscale SSH, on the tailnet address. OpenSSH is disabled and masked, and no NSG rule ever admits admin SSH. The VM's admin account (`azureuser`) holds your public key only because Azure requires one. Break-glass is `az vm run-command` and the serial console ([below](#break-glass)).
 
@@ -151,7 +156,7 @@ What `azure.sh` does, in order:
 1. Picks the region and checks the VM size there.
 2. Creates the resource group, VNet, NSG (no inbound allow rules), static IP and VM (`--nsg-rule NONE`). Existing resources are left alone.
 3. Enables boot diagnostics, for the serial console.
-4. Sends `deploy/` to the VM inside one `az vm run-command invoke` script and runs `bootstrap.sh` as root. Bootstrap installs Docker and Tailscale, joins the tailnet with `tailscale up --ssh`, masks `ssh.socket` and `ssh.service`, adds a 1 GiB swap file, creates the `deploy` user, installs `/opt/portfolio`, pulls the image and starts the stack. It waits for the portfolio's health check and prints the fingerprint, then `BOOTSTRAP_OK`.
+4. Sends `deploy/` to the VM inside one `az vm run-command invoke` script and runs `bootstrap.sh` as root. Bootstrap installs Docker (pinning `daemon.json`) and Tailscale, adds the rate limit, joins the tailnet with `tailscale up --ssh`, masks `ssh.socket` and `ssh.service`, adds a 1 GiB swap file, creates the `deploy` user, installs `/opt/portfolio`, pulls the image and starts the stack. It waits for the portfolio's health check and prints the fingerprint, then `BOOTSTRAP_OK`.
 5. Only on `BOOTSTRAP_OK`, adds the NSG rule for TCP 22, 2222, 80 and 443.
 
 The auth key never appears in output or in the repo. It travels in the run-command script, from a mode-0600 temp file that is deleted on exit. The Azure agent keeps a root-only copy of that script on the VM, which is why the key must be one-off.
@@ -311,7 +316,9 @@ The health check proves an SSH key exchange, not a full session. `restart: unles
 | Region policy or size restriction | `azure.sh` checks both and falls back to `westus2` |
 | Corporate or campus networks block outbound 22 | Advertise `ssh -p 2222 ssh.aidanjeon.com` next to the main command |
 | Host key loss | Offline backup, restored with `--no-start`. If truly lost: publish the new fingerprint with a dated note, and update `HOST_KEY_FINGERPRINT` |
-| Bot traffic on 22 (scanners, brute force) | Anonymous sessions only run the TUI. Limits: 32 sessions, 3 per IP, 300 s idle, 1800 s max, CPU/memory/PID caps, bounded logs. The NSG cannot rate-limit; use the `DOCKER-USER` iptables chain if needed |
+| Bot traffic on 22 (scanners, brute force) | Anonymous sessions only run the TUI. Limits: 32 sessions, 3 per IP, 300 s idle, 1800 s max, 10 new connections/min per IP after a burst of 20 (`DOCKER-USER` hashlimit), CPU/memory/PID caps, bounded logs |
+| Visitors behind a shared NAT (campus, office, carrier) | They share one public address, so 3 concurrent sessions and one rate bucket between them. Raise `--max-per-ip` if that bites |
+| Real client IPs lost (Docker's `iptables` off, or a proxy in front) | Every visitor would count as one address. `daemon.json` pins `"iptables": true`; the launch checklist verifies real IPs |
 | A port published by mistake | The NSG admits only TCP 22, 2222, 80 and 443, whatever compose publishes |
 | IPv6 | Not offered: IPv4 VNet and IP, no AAAA. Adding it needs a dual-stack VNet and IP, and a check that the container sees real IPv6 peers, since Docker's default bridge shows them all as the gateway and `--max-per-ip` would count them together |
 | Tailscale down or misconfigured | Run Command or the serial console ([Break-glass](#break-glass)) |
@@ -330,6 +337,8 @@ The health check proves an SSH key exchange, not a full session. `restart: unles
 - [ ] Stack up; `portfolio` healthy; read-only, non-root, limits applied (`docker inspect`)
 - [ ] Fingerprint recorded; host key backed up offline and test-restored (or the tar listed and checked)
 - [ ] `ssh <ip>` and `ssh -p 2222 <ip>` work
+- [ ] While connected from another network (e.g. a phone hotspot), the container sees your real public IP, not a `172.x` gateway: as root on the VM, `nsenter -t "$(docker inspect -f '{{.State.Pid}}' portfolio-portfolio-1)" -n ss -tn state established '( sport = :2222 )'` lists your phone network's address (compare `curl -s https://ifconfig.me` there)
+- [ ] `iptables -L PORTFOLIO-RATE -nv` lists the hashlimit rule, and `systemctl is-enabled portfolio-ratelimit` says `enabled`
 - [ ] Cost analysis a few days in shows only free meters (or cents); budget alert set
 - [ ] Namecheap screenshot taken; TTL lowered a day ahead; CAA allows Let's Encrypt
 - [ ] `ssh` A record → VM; certificate obtained; `ssh ssh.aidanjeon.com` works
