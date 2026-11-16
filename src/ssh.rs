@@ -26,6 +26,8 @@ use tokio::{
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[2J\x1b[H";
+/// Starts the repaint after a resize.
+const CLEAR: &[u8] = b"\x1b[2J\x1b[H";
 const LEAVE: &[u8] = b"\x1b]8;;\x1b\\\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l";
 const TIME_LIMIT_MESSAGE: &[u8] = b"\r\nsession time limit reached\r\n";
 const ERROR_MESSAGE: &[u8] = b"\r\nthe portfolio hit a problem, sorry; please reconnect\r\n";
@@ -1150,6 +1152,10 @@ async fn run_portfolio(
     let mut pacer = Pacer::new(Instant::now());
     let mut last_input = Instant::now();
     let mut escape_deadline = None;
+    // The latest window size not yet applied. Rebuilding the terminal costs a full repaint, so
+    // a flood of window changes is applied at most once per RESIZE_INTERVAL, latest size last.
+    let mut resize: Option<Rect> = None;
+    let mut next_resize = Instant::now();
     let reason = loop {
         let escape_at = escape_deadline.unwrap_or_else(|| Instant::now() + limits.idle);
         let reading = pacer.ready(Instant::now());
@@ -1157,24 +1163,9 @@ async fn run_portfolio(
             biased;
             changed = control.changed() => {
                 if changed.is_err() { break Reason::Closed; }
-                let size = *control.borrow_and_update();
-                if let Some(size) = size.filter(|size| terminal.is_none() || *size != area) {
-                    let mut new_terminal = Terminal::with_options(CrosstermBackend::new(Vec::new()), TerminalOptions { viewport: Viewport::Fixed(size) })?;
-                    // Carry over bytes not yet sent, such as the switch to the alternate
-                    // screen when the window changes before the first frame goes out.
-                    let prefix = match terminal.as_mut() {
-                        None => ENTER.to_vec(),
-                        Some(old) => [std::mem::take(old.backend_mut().writer_mut()).as_slice(), b"\x1b[2J\x1b[H"].concat(),
-                    };
-                    new_terminal.backend_mut().write_all(&prefix)?;
-                    terminal = Some(new_terminal);
-                    area = size;
-                    // Keys that arrive before the next frame act on the new size's layout.
-                    ui::relayout(&mut app, content, area.width, area.height);
-                    *entered = true;
-                    pacer.changed();
-                }
+                resize = *control.borrow_and_update();
             }
+            _ = sleep_until(next_resize), if resize.is_some() => {}
             _ = limits.shutdown.wait_for(|stopping| *stopping) => break Reason::Restart,
             _ = sleep_until(limits.deadline) => break Reason::Limit,
             _ = sleep_until(last_input + limits.idle) => break Reason::Idle,
@@ -1189,11 +1180,16 @@ async fn run_portfolio(
             }
             // The latest state is always drawn, at most once per FRAME_INTERVAL.
             _ = sleep_until(pacer.next_frame), if pacer.dirty => {}
-            // Out of key budget: input stays unread, russh's small channel buffer fills, and
-            // TCP backpressure slows the client, instead of the server decrypting a flood
-            // only to drop it.
-            _ = sleep_until(pacer.next_key()), if !reading => {}
+            // Out of key or input budget: input stays unread, russh's small channel buffer
+            // fills, and TCP backpressure slows the client, instead of the server decrypting
+            // a flood only to drop it. Window changes queue behind it in the same buffer.
+            _ = sleep_until(pacer.next_read()), if !reading => {}
             event = channel.wait(), if reading => {
+                let data = match &event {
+                    Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => data.len(),
+                    _ => 0,
+                };
+                pacer.received(Instant::now(), data);
                 match event {
                     None | Some(ChannelMsg::Eof | ChannelMsg::Close) => break Reason::Closed,
                     Some(ChannelMsg::Data { data }) if terminal.is_some() => {
@@ -1213,6 +1209,37 @@ async fn run_portfolio(
                     Some(ChannelMsg::Signal { signal: russh::Sig::INT | russh::Sig::TERM }) => break Reason::Closed,
                     _ => continue,
                 }
+            }
+        }
+        if let Some(size) = resize
+            && Instant::now() >= next_resize
+        {
+            resize = None;
+            if terminal.is_none() || size != area {
+                let mut new_terminal = Terminal::with_options(
+                    CrosstermBackend::new(Vec::new()),
+                    TerminalOptions {
+                        viewport: Viewport::Fixed(size),
+                    },
+                )?;
+                // Carry over bytes not yet sent, such as the switch to the alternate
+                // screen when the window changes before the first frame goes out.
+                let prefix = match terminal.as_mut() {
+                    None => ENTER.to_vec(),
+                    Some(old) => [
+                        std::mem::take(old.backend_mut().writer_mut()).as_slice(),
+                        CLEAR,
+                    ]
+                    .concat(),
+                };
+                new_terminal.backend_mut().write_all(&prefix)?;
+                terminal = Some(new_terminal);
+                area = size;
+                // Keys that arrive before the next frame act on the new size's layout.
+                ui::relayout(&mut app, content, area.width, area.height);
+                *entered = true;
+                pacer.changed();
+                next_resize = Instant::now() + RESIZE_INTERVAL;
             }
         }
         if app.quit {
@@ -1261,20 +1288,40 @@ impl Bucket {
         self.tokens -= taken as f64;
         taken
     }
+
+    /// When the bucket will hold `level` tokens (now, if it already does).
+    fn when(&self, level: f64) -> Instant {
+        let missing = (level - self.tokens).max(0.0);
+        self.updated + Duration::from_secs_f64(missing / self.per_second)
+    }
 }
 
 /// Keys a session may apply: a held-down key repeats at roughly 30 per second, so 60 per
 /// second with a burst of 30 never drops typing, only floods.
 const KEYS_PER_SECOND: f64 = 60.0;
 const KEY_BURST: f64 = 30.0;
+/// Input a session may send, in bytes: 64 KiB a second after a burst of 256 KiB. Keys are a
+/// few bytes each, so this only binds input that yields none (bracketed pastes, NULs, invalid
+/// UTF-8, unknown escapes), which the key budget alone would let through unmetered.
+const INPUT_BYTES_PER_SECOND: f64 = 64.0 * 1024.0;
+const INPUT_BYTE_BURST: f64 = 256.0 * 1024.0;
+/// What each channel message costs on top of its data, about its SSH framing and MAC, so
+/// that empty messages and window changes are not free either.
+const MESSAGE_COST: usize = 64;
 /// At most ~30 frames per second per session.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// At most 10 terminal rebuilds per second per session; the latest size is always applied.
+const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Caps a session's CPU however fast its client sends: keys beyond the key budget are
-/// dropped rather than queued, and changes are drawn at most once per `FRAME_INTERVAL`, so
-/// a burst of input or of window changes becomes one frame showing the final state.
+/// dropped rather than queued, input past the byte budget is left unread, and changes are
+/// drawn at most once per `FRAME_INTERVAL`, so a burst of input or of window changes becomes
+/// one frame showing the final state.
 struct Pacer {
     keys: Bucket,
+    /// Input bytes. A message is read whole, so this may go negative; reading resumes once
+    /// it has refilled to zero.
+    bytes: Bucket,
     /// Something changed since the last frame.
     dirty: bool,
     next_frame: Instant,
@@ -1284,9 +1331,16 @@ impl Pacer {
     fn new(now: Instant) -> Self {
         Self {
             keys: Bucket::full(KEYS_PER_SECOND, KEY_BURST, now),
+            bytes: Bucket::full(INPUT_BYTES_PER_SECOND, INPUT_BYTE_BURST, now),
             dirty: false,
             next_frame: now,
         }
+    }
+
+    /// Charges a channel message carrying `data` bytes against the input budget.
+    fn received(&mut self, now: Instant, data: usize) {
+        self.bytes.refill(now);
+        self.bytes.tokens -= (data + MESSAGE_COST) as f64;
     }
 
     /// Keeps the keys the budget allows and drops the rest.
@@ -1307,16 +1361,17 @@ impl Pacer {
         self.next_frame = now + FRAME_INTERVAL;
     }
 
-    /// Whether a key could be applied now. Until one can, input is left unread.
+    /// Whether input may be read now: a key could be applied and the byte budget is not in
+    /// debt. Until both hold, input is left unread.
     fn ready(&mut self, now: Instant) -> bool {
         self.keys.refill(now);
-        self.keys.tokens >= 1.0
+        self.bytes.refill(now);
+        self.keys.tokens >= 1.0 && self.bytes.tokens >= 0.0
     }
 
-    /// When the budget next holds a whole key.
-    fn next_key(&self) -> Instant {
-        let missing = (1.0 - self.keys.tokens).max(0.0);
-        self.keys.updated + Duration::from_secs_f64(missing / self.keys.per_second)
+    /// When `ready` next holds.
+    fn next_read(&self) -> Instant {
+        self.keys.when(1.0).max(self.bytes.when(0.0))
     }
 }
 
@@ -1476,6 +1531,114 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             ..Config::default()
         }
+    }
+
+    /// What a flood test sends, and how long it waits after each message. russh's client
+    /// queues messages without limit and reads only between writes, so a flood the channel
+    /// window does not throttle (small keys, window changes) needs a gap: still many messages
+    /// per frame interval, but each reaches the server when it is sent and replies are read.
+    enum Load {
+        /// `start` once, then data messages cycling through `packets`.
+        Packets {
+            start: &'static [u8],
+            packets: Vec<Vec<u8>>,
+            gap: Duration,
+        },
+        /// Window changes alternating between two sizes, then `last`.
+        Resizes { last: (u32, u32), gap: Duration },
+    }
+
+    /// What a flood saw: how much the client got the server to take, and what came back.
+    struct Flooded {
+        /// Data bytes, or window changes, the client finished sending before the deadline.
+        sent: usize,
+        output: Vec<u8>,
+        /// From the start of the flood until the last read.
+        elapsed: Duration,
+    }
+
+    /// Opens a visit and, once the first frame is in, sends `load` for `period` while reading
+    /// everything the server writes. Reading goes on for `drain` after the flood, so frames
+    /// still due are counted.
+    async fn flood(addr: SocketAddr, load: Load, period: Duration, drain: Duration) -> Flooded {
+        let mut visit = Visit::open(addr, true).await;
+        visit.read_until(ENTER).await;
+        let Visit {
+            handle, channel, ..
+        } = visit;
+        let (mut read, write) = channel.split();
+        let write = &write;
+        let started = Instant::now();
+        let until = started + period;
+        let writer = async {
+            let mut sent = 0;
+            if let Load::Packets { start, .. } = &load {
+                write.data(*start).await.unwrap();
+            }
+            for step in 0.. {
+                if Instant::now() >= until {
+                    break;
+                }
+                let (send, gap) = match &load {
+                    Load::Packets { packets, gap, .. } => {
+                        let packet = &packets[step % packets.len()];
+                        let send: Pin<Box<dyn Future<Output = _> + Send>> = Box::pin(async {
+                            write.data(&packet[..]).await.map(|()| packet.len())
+                        });
+                        (send, *gap)
+                    }
+                    Load::Resizes { gap, .. } => {
+                        let cols = if step % 2 == 0 { 120 } else { 100 };
+                        let send: Pin<Box<dyn Future<Output = _> + Send>> = Box::pin(async move {
+                            write.window_change(cols, 40, 0, 0).await.map(|()| 1)
+                        });
+                        (send, *gap)
+                    }
+                };
+                let Ok(result) = tokio::time::timeout_at(until, send).await else {
+                    break;
+                };
+                sent += result.expect("the server ended the session");
+                sleep(gap).await;
+            }
+            if let Load::Resizes {
+                last: (cols, rows), ..
+            } = load
+            {
+                write.window_change(cols, rows, 0, 0).await.unwrap();
+            }
+            sent
+        };
+        let reader = async {
+            let mut output = Vec::new();
+            let _ = tokio::time::timeout_at(until + drain, async {
+                while let Some(message) = read.wait().await {
+                    if let ChannelMsg::Data { data } = message {
+                        output.extend_from_slice(&data);
+                    }
+                }
+            })
+            .await;
+            output
+        };
+        let (sent, output) = tokio::join!(writer, reader);
+        let elapsed = started.elapsed();
+        drop(handle);
+        Flooded {
+            sent,
+            output,
+            elapsed,
+        }
+    }
+
+    /// How long a flood test keeps reading after the flood, for the frame still due.
+    const DRAIN: Duration = Duration::from_millis(300);
+
+    fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
     }
 
     #[tokio::test]
@@ -2134,7 +2297,7 @@ mod tests {
             vec![crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')); MAX_KEYS];
         fresh.admit(start, &mut keys);
         assert!(!fresh.ready(start));
-        let next = fresh.next_key();
+        let next = fresh.next_read();
         assert!(
             next > start && next <= start + Duration::from_millis(17),
             "{:?}",
@@ -2150,6 +2313,51 @@ mod tests {
             vec![crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')); 10];
         pacer.admit(later, &mut keys);
         assert_eq!(keys.len(), 10);
+    }
+
+    #[test]
+    fn input_that_yields_no_keys_still_spends_the_byte_budget() {
+        let start = Instant::now();
+        // Full packets read whenever the budget allows, for ten seconds.
+        let mut pacer = Pacer::new(start);
+        let (mut bytes, mut messages) = (0, 0);
+        for ms in 0..10_000 {
+            let now = start + Duration::from_millis(ms);
+            while pacer.ready(now) {
+                pacer.received(now, 32768);
+                bytes += 32768 + MESSAGE_COST;
+                messages += 1;
+            }
+        }
+        let budget = INPUT_BYTE_BURST + INPUT_BYTES_PER_SECOND * 10.0;
+        let allowed = budget as usize + 32768 + MESSAGE_COST;
+        assert!(
+            bytes <= allowed && bytes > budget as usize - 32768,
+            "{bytes} bytes"
+        );
+        assert!(messages > 0);
+        // Once in debt, nothing is read until the budget is back to zero.
+        let mut fresh = Pacer::new(start);
+        fresh.received(start, INPUT_BYTE_BURST as usize + 6400);
+        assert!(!fresh.ready(start));
+        let next = fresh.next_read();
+        let wait = (6400 + MESSAGE_COST) as f64 / INPUT_BYTES_PER_SECOND;
+        assert!(
+            (next - start).as_secs_f64() >= wait - 0.001,
+            "{:?}",
+            next - start
+        );
+        assert!(!fresh.ready(next - Duration::from_millis(10)));
+        assert!(fresh.ready(next + Duration::from_millis(1)));
+        // Empty messages are not free either.
+        let mut empty = Pacer::new(start);
+        let mut count = 0;
+        while empty.ready(start) {
+            empty.received(start, 0);
+            count += 1;
+        }
+        // Reading stops once a message takes the budget below zero.
+        assert_eq!(count, INPUT_BYTE_BURST as usize / MESSAGE_COST + 1);
     }
 
     #[tokio::test]
@@ -2168,6 +2376,62 @@ mod tests {
         visit.read_until(b"Copperlane").await;
         visit.send(b"q").await;
         visit.read_until(b"thanks for stopping by").await;
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_without_keys_is_read_no_faster_than_the_byte_budget() {
+        let server = TestServer::start(test_config()).await;
+        // An endless bracketed paste: the decoder discards it, so it never spends a key.
+        let packet = 32768;
+        let load = Load::Packets {
+            start: b"\x1b[200~",
+            packets: vec![vec![b'x'; packet]],
+            gap: Duration::ZERO,
+        };
+        let seen = flood(server.addr, load, Duration::from_secs(2), Duration::ZERO).await;
+        // What the budget allows, the last message read into debt, and what the client can
+        // have in flight while reading is paused: russh's channel buffer and receive window.
+        let budget = INPUT_BYTE_BURST + INPUT_BYTES_PER_SECOND * seen.elapsed.as_secs_f64();
+        let in_flight = packet * (1 + 16) + 65536;
+        let bound = budget as usize + in_flight;
+        assert!(
+            seen.sent <= bound,
+            "{} bytes in {:?}",
+            seen.sent,
+            seen.elapsed
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_window_change_flood_rebuilds_the_terminal_at_a_bounded_rate() {
+        let server = TestServer::start(test_config()).await;
+        let load = Load::Resizes {
+            last: (30, 8),
+            gap: Duration::from_millis(2),
+        };
+        let seen = flood(server.addr, load, Duration::from_secs(1), DRAIN).await;
+        let rebuilds = occurrences(&seen.output, CLEAR);
+        let bound = (seen.elapsed.as_millis() / RESIZE_INTERVAL.as_millis()) as usize + 1;
+        assert!(
+            seen.sent > 2 * bound,
+            "the flood sent only {} changes",
+            seen.sent
+        );
+        assert!(
+            rebuilds <= bound,
+            "{rebuilds} rebuilds in {:?}",
+            seen.elapsed
+        );
+        // The last size always wins: 30x8 is too small for the page.
+        let last = seen
+            .output
+            .windows(CLEAR.len())
+            .rposition(|window| window == CLEAR)
+            .expect("no rebuild");
+        let tail = String::from_utf8_lossy(&seen.output[last..]);
+        assert!(tail.contains("Resize to at least"), "{tail:?}");
         server.stop().await;
     }
 
