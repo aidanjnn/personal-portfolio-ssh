@@ -184,13 +184,23 @@ fn sanitize(text: &str) -> String {
 const MAX_ERROR_CHARS: usize = 200;
 
 fn fetch_https(url: &str) -> Result<String, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(FETCH_TIMEOUT))
-        .https_only(true)
+    fetch(&agent(FETCH_TIMEOUT, true), url)
+}
+
+/// One deadline for the whole request, no redirects (the configured URL is canonical,
+/// so a 3xx is an error) and no proxy, whatever HTTP(S)_PROXY or ALL_PROXY say.
+fn agent(timeout: Duration, https_only: bool) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .https_only(https_only)
         .http_status_as_error(false)
-        .max_redirects(3)
+        .max_redirects(0)
+        .proxy(None)
         .build()
-        .into();
+        .into()
+}
+
+fn fetch(agent: &ureq::Agent, url: &str) -> Result<String, String> {
     let mut response = agent.get(url).call().map_err(|error| error.to_string())?;
     if response.status() != 200 {
         return Err(format!("HTTP {}", response.status().as_u16()));
@@ -206,9 +216,14 @@ fn fetch_https(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
     };
 
     fn bundled() -> Portfolio {
@@ -463,5 +478,121 @@ mod tests {
         let store = ContentStore::new(bundled(), None);
         let (_shutdown, shutdown_rx) = watch::channel(false);
         store.run(shutdown_rx).await;
+    }
+
+    /// A local plain-HTTP server: reads each request head, counts it and hands the
+    /// connection to `respond`. Returns the base URL and the request counter.
+    fn local_server(
+        respond: impl Fn(&mut TcpStream) + Send + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = BufReader::new(&stream);
+                let mut line = String::new();
+                while head.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                respond(&mut stream);
+            }
+        });
+        (base, requests)
+    }
+
+    fn reply(status: &str, headers: &str, body: &str) -> impl Fn(&mut TcpStream) + use<> {
+        let response = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        move |stream| {
+            let _ = stream.write_all(response.as_bytes());
+        }
+    }
+
+    /// Keeps the connection open, sending nothing more, until the client hangs up.
+    fn hold(stream: &mut TcpStream) {
+        let _ = stream.read_to_end(&mut Vec::new());
+    }
+
+    fn test_agent(timeout: Duration) -> ureq::Agent {
+        agent(timeout, false)
+    }
+
+    #[test]
+    fn fetch_returns_a_good_body() {
+        let body = updated_json();
+        let (base, _) = local_server(reply("200 OK", "", &body));
+        let agent = test_agent(FETCH_TIMEOUT);
+        assert_eq!(fetch(&agent, &format!("{base}/portfolio.json")), Ok(body));
+    }
+
+    #[test]
+    fn fetch_treats_a_404_as_an_error() {
+        let (base, _) = local_server(reply("404 Not Found", "", "missing"));
+        let agent = test_agent(FETCH_TIMEOUT);
+        assert_eq!(
+            fetch(&agent, &format!("{base}/portfolio.json")),
+            Err("HTTP 404".into())
+        );
+    }
+
+    #[test]
+    fn fetch_does_not_follow_redirects() {
+        let (base, requests) =
+            local_server(reply("302 Found", "Location: /elsewhere.json\r\n", ""));
+        let agent = test_agent(FETCH_TIMEOUT);
+        assert_eq!(
+            fetch(&agent, &format!("{base}/portfolio.json")),
+            Err("HTTP 302".into())
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fetch_cuts_off_an_oversized_body_while_streaming() {
+        // Chunks past the 1 MiB cap with no length up front and no end: only the cap,
+        // not the server finishing or the deadline, can end this read.
+        let (base, _) = local_server(|stream| {
+            let chunk = format!("10000\r\n{}\r\n", " ".repeat(0x10000));
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            for _ in 0..=MAX_SNAPSHOT_BYTES / 0x10000 {
+                if stream.write_all(chunk.as_bytes()).is_err() {
+                    return;
+                }
+            }
+            hold(stream);
+        });
+        let agent = test_agent(Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        let error = fetch(&agent, &format!("{base}/portfolio.json")).unwrap_err();
+        assert!(error.contains("larger than request limit"), "{error}");
+        assert!(started.elapsed() < FETCH_TIMEOUT, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn fetch_gives_up_on_a_stalled_server_within_the_deadline() {
+        let deadline = Duration::from_millis(300);
+        let stalls: [fn(&mut TcpStream); 2] = [
+            // Never answers.
+            hold,
+            // Starts the body, then stops.
+            |stream| {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{");
+                hold(stream);
+            },
+        ];
+        for stall in stalls {
+            let (base, _) = local_server(stall);
+            let agent = test_agent(deadline);
+            let started = std::time::Instant::now();
+            let error = fetch(&agent, &format!("{base}/portfolio.json")).unwrap_err();
+            let elapsed = started.elapsed();
+            assert!(error.contains("timeout"), "{error}");
+            assert!(elapsed >= deadline && elapsed < deadline * 4, "{elapsed:?}");
+        }
     }
 }

@@ -2,6 +2,8 @@
 
 The website is the source of truth. Its build serves `https://www.aidanjeon.com/portfolio.json`, generated from its own `content/*.ts`. The SSH server bundles a snapshot of that file (`content/portfolio.json`) and, when started with `--content-url`, refreshes it from the website in the background: once at startup and then once a minute, with a 2 s timeout, keeping the last good copy. A fetch still running when the next minute comes skips that tick rather than starting a second one. A visitor never waits on the network. Each session keeps the snapshot it started with.
 
+The fetch follows no redirects: the configured URL is canonical, so a 3xx response is a failed refresh, like a 404. It also ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` and always connects directly.
+
 To change copy, edit the website. Its CI validates the `/portfolio.json` it is about to deploy with this server's own validator (`--check-content`, run from the published image), so a content edit the server would reject fails the website's build instead of silently freezing the SSH portfolio on its last good copy.
 
 Check a file by hand, or refresh the bundled fallback when convenient:
