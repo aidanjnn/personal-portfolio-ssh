@@ -10,11 +10,16 @@ mod ui;
 use crossterm::event::{self, Event};
 use std::{
     ffi::OsStr,
+    future::Future,
     io::{self, IsTerminal, Read, Write},
     time::Duration,
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// How long the server's exit waits for blocking work still running, such as a content
+/// fetch, which can take up to `store::FETCH_TIMEOUT`.
+const RUNTIME_SHUTDOWN: Duration = Duration::from_millis(500);
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,10 +50,7 @@ fn main() -> Result<(), Error> {
     }
     if args.first().is_some_and(|arg| arg == "serve") {
         let config = parse_server_args(&args[1..])?;
-        return tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(ssh::serve(config, content));
+        return block_on(ssh::serve(config, content))?;
     }
     let links = match args.as_slice() {
         [] => true,
@@ -69,6 +71,18 @@ fn main() -> Result<(), Error> {
     // The restored terminal translates newlines itself.
     println!("\n{}", ui::goodbye(&content.web));
     Ok(())
+}
+
+/// Runs `future` on a new multi-threaded runtime, then gives blocking work still running at
+/// most `RUNTIME_SHUTDOWN` to finish. Dropping the runtime instead would wait for it, so an
+/// in-flight content fetch could hold up exit for its whole timeout.
+fn block_on<T>(future: impl Future<Output = T>) -> io::Result<T> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+    Ok(output)
 }
 
 /// Reads a snapshot from a file, or stdin for `-`, stopping one byte past the size cap.
@@ -179,6 +193,20 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_does_not_wait_out_a_blocking_fetch() {
+        let started = std::time::Instant::now();
+        block_on(async {
+            // A fetch stuck until its timeout, still running when the server returns.
+            drop(tokio::task::spawn_blocking(|| {
+                std::thread::sleep(store::FETCH_TIMEOUT * 2);
+            }));
+        })
+        .unwrap();
+        let waited = started.elapsed();
+        assert!(waited < store::FETCH_TIMEOUT, "exit waited {waited:?}");
+    }
 
     #[test]
     fn server_config_defaults_to_localhost_and_rejects_unbounded_limits() {

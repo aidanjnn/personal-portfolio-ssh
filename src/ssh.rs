@@ -42,8 +42,6 @@ const DEADLINE_GRACE: Duration = Duration::from_secs(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// How long a client gets to hang up by itself after its channel closes.
 const HANGUP_GRACE: Duration = Duration::from_secs(1);
-/// How long a stopping server waits for the content refresher task to end.
-const REFRESHER_GRACE: Duration = Duration::from_secs(1);
 const RESTART_MESSAGE: &[u8] = b"\r\nthe portfolio is restarting, try again in a moment\r\n";
 /// How much longer than the portfolio's idle timer russh waits before dropping a connection.
 /// Before the shell starts, the setup deadline is the real limit; after it, this only has
@@ -223,9 +221,10 @@ async fn run_server(
     // Every connection ends within a bounded time (Connection::run), so this cannot hang.
     while connections.join_next().await.is_some() {}
     log.summarize();
-    // The refresher stops as soon as it sees `shutdown`; a fetch it started runs on a
-    // blocking thread it does not wait for. Bound the wait anyway so it cannot stall exit.
-    let _ = timeout(REFRESHER_GRACE, refresher).await;
+    // The refresher's loop ends as soon as it sees `shutdown`, so this returns at once. A
+    // fetch it started keeps running on Tokio's blocking pool, and the runtime would wait for
+    // it when dropped; `main` bounds that wait with `shutdown_timeout`.
+    let _ = refresher.await;
     Ok(())
 }
 
