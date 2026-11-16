@@ -312,10 +312,16 @@ fn validate_count(field: &str, count: usize, maximum: usize) -> Result<(), Conte
     Ok(())
 }
 
-/// Whether `text` draws at least one glyph: whitespace and zero-width marks alone do not.
+/// U+2800 BRAILLE PATTERN BLANK is a symbol (So) one column wide that draws no dots, so it
+/// passes the category and width checks while showing nothing.
+const BRAILLE_BLANK: char = '\u{2800}';
+
+/// Whether `text` draws at least one glyph: whitespace, zero-width marks and the Braille blank
+/// alone do not.
 fn has_visible_text(text: &str) -> bool {
-    text.chars()
-        .any(|ch| !ch.is_whitespace() && ch.width().is_some_and(|width| width > 0))
+    text.chars().any(|ch| {
+        !ch.is_whitespace() && ch != BRAILLE_BLANK && ch.width().is_some_and(|width| width > 0)
+    })
 }
 
 fn validate_text(field: &str, text: &str, maximum: usize) -> Result<(), ContentError> {
@@ -684,7 +690,14 @@ mod tests {
 
     #[test]
     fn linked_spans_need_visible_text() {
-        for text in [" ", "\u{3000}", "\u{301}", "  \u{301} "] {
+        for text in [
+            " ",
+            "\u{3000}",
+            "\u{301}",
+            "  \u{301} ",
+            "\u{2800}",
+            " \u{2800}\u{2800} ",
+        ] {
             let mut content = bundled_data();
             let span = content.intro[1]
                 .iter_mut()
@@ -693,6 +706,12 @@ mod tests {
             span.text = text.into();
             assert!(content.validate().is_err(), "accepted link text {text:?}");
         }
+        // Required text must draw something too; Braille with dots does.
+        let mut content = bundled_data();
+        content.projects[0].title = "\u{2800}".into();
+        assert!(content.validate().is_err());
+        content.projects[0].title = "\u{2800}\u{2801}".into();
+        assert!(content.validate().is_ok());
         // Unlinked spans may still be bare joins such as ", " or " ".
         let mut content = bundled_data();
         content.intro[0].push(Span {
