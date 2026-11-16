@@ -17,5 +17,9 @@
 }
 
 aidanjeon.com, ssh.aidanjeon.com {
+	# Vercel answers the apex with exactly this header (2 years, no
+	# includeSubDomains, no preload), so browsers already hold it. Send the
+	# same so the policy neither lapses nor widens after the move.
+	header Strict-Transport-Security "max-age=63072000"
 	redir https://www.aidanjeon.com{uri} 308
 }

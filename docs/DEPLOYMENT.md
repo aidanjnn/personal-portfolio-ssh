@@ -34,7 +34,7 @@ x64, not Arm: the image is built for linux/amd64 only.
 | `deploy/azure.sh` | runs on your laptop | Creates the Azure resources, runs bootstrap over run-command, then opens the NSG |
 | `deploy/bootstrap.sh` | sent by `azure.sh` | Docker (pinned `/etc/docker/daemon.json`), rate limit, Tailscale (joins with `--ssh`), OpenSSH masked, `deploy` user, `/opt/portfolio`, starts the stack |
 | `deploy/compose.prod.yaml` | `/opt/portfolio/compose.prod.yaml` | `portfolio` and `caddy` services, hardened |
-| `deploy/Caddyfile` | `/opt/portfolio/Caddyfile` | Apex and `ssh.` redirects, automatic Let's Encrypt, HTTP/1.1 and HTTP/2 only |
+| `deploy/Caddyfile` | `/opt/portfolio/Caddyfile` | Apex and `ssh.` redirects with Vercel's HSTS header, automatic Let's Encrypt, HTTP/1.1 and HTTP/2 only |
 | `deploy/fingerprint.sh` | `/opt/portfolio/fingerprint.sh` | Prints the host-key fingerprint to publish |
 | `deploy/ratelimit.sh` | `/usr/local/sbin/portfolio-ratelimit` | Per-address connection-rate limit in `DOCKER-USER`, run by `portfolio-ratelimit.service` after every docker start |
 | `.github/workflows/deploy.yml` | GitHub Actions | Builds/pushes the image on `v*` tags; optional rollout over Tailscale SSH |
@@ -225,17 +225,20 @@ Neither path needs OpenSSH, so it stays masked.
 DNS is at Namecheap (Domain List → `aidanjeon.com` → Advanced DNS). Today the apex A record points at Vercel (`216.198.79.1`), which already redirects it to `www`. Change **only** the apex A record and add `ssh`. Leave the `www` CNAME, every MX and TXT record, and Mail Settings (email forwarding) exactly as they are.
 
 1. **A day before:** screenshot the host records and Mail Settings. Lower the `@` A record's TTL to 5 min and wait out the old TTL. If `dig +short CAA aidanjeon.com` returns anything, it must allow `letsencrypt.org`.
-2. **Add `ssh` first:** A record, host `ssh`, value `<vm-ip>`, TTL 5 min. Nothing depends on this name yet, so it tests the VM end to end before the apex moves:
+2. **Add `ssh` first:** A record, host `ssh`, value `<vm-ip>`, TTL 5 min. Nothing depends on this name yet, so it tests the VM end to end before the apex moves. Caddy has been failing ACME for this name since it started and backs off longer after each failure, so as soon as `dig +short ssh.aidanjeon.com @1.1.1.1` returns the VM, restart it to retry now:
    ```sh
+   ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml restart caddy'
    curl -sSI https://ssh.aidanjeon.com       # 308 to https://www.aidanjeon.com/ (may take a minute for the certificate)
    ssh ssh.aidanjeon.com                     # portfolio; fingerprint matches
    ```
-3. **Confirm** `curl -sSI https://aidanjeon.com` still shows Vercel's `308` to `https://www.aidanjeon.com/`, and `docker compose -f /opt/portfolio/compose.prod.yaml ps` shows `portfolio` healthy.
-4. **Move the apex:** edit the A record with host `@` from `216.198.79.1` to `<vm-ip>`. Change nothing else. No AAAA record: the VM is IPv4 only.
-5. **Certificates:** once `dig +short aidanjeon.com @1.1.1.1` returns the VM, run `ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml restart caddy'` to retry ACME now. Watch `logs -f caddy` for "certificate obtained".
+3. **Confirm** `curl -sSI https://aidanjeon.com` still shows Vercel's redirect (`307` to `https://www.aidanjeon.com/`, with `strict-transport-security: max-age=63072000`), and `docker compose -f /opt/portfolio/compose.prod.yaml ps` shows `portfolio` healthy.
+4. **Move the apex at a quiet hour** (e.g. late evening Pacific): edit the A record with host `@` from `216.198.79.1` to `<vm-ip>`. Change nothing else. No AAAA record: the VM is IPv4 only.
+
+   Why the quiet hour: Vercel sends `Strict-Transport-Security` for the apex, so every browser that has visited `aidanjeon.com` in the last two years insists on HTTPS there and won't let anyone click past a certificate error. From the moment a resolver hands out the VM's address until Caddy has a certificate for the apex, those browsers get a hard error instead of the redirect. Keep that window short and at a time few people visit. Caddy sends the same HSTS header as Vercel (`deploy/Caddyfile`), so the policy neither lapses nor changes afterwards.
+5. **Certificates:** once `dig +short aidanjeon.com @1.1.1.1` returns the VM, restart Caddy so ACME retries right away instead of waiting out its backoff: `ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml restart caddy'`. Watch `logs -f caddy` for "certificate obtained". If a resolver Let's Encrypt uses still had the old address, the attempt fails; wait for the old TTL and restart once more.
 6. **Verify:**
    ```sh
-   curl -sSI https://aidanjeon.com          # 308, location: https://www.aidanjeon.com/
+   curl -sSI https://aidanjeon.com          # 308, location: https://www.aidanjeon.com/, strict-transport-security: max-age=63072000
    curl -sSI https://aidanjeon.com/a?b=c    # location keeps /a?b=c
    curl -sSI http://ssh.aidanjeon.com       # 308 to https, then 308 to www
    dig +short MX aidanjeon.com; dig +short TXT aidanjeon.com   # same as the screenshot
@@ -336,7 +339,8 @@ After any manual upgrade or reboot, check the fingerprint.
 | Tailscale down or misconfigured | Run Command or the serial console ([Break-glass](#break-glass)) |
 | Auth key copy on the VM | The run-command script stays in a root-only agent directory. The key is one-off, tagged, and expires in a day |
 | 1 GiB RAM, burstable CPU | Swap file; containers capped at 256 + 128 MiB and 0.5 CPU each. Watch CPU credits |
-| ACME fails at cutover | Restart Caddy after DNS resolves. Mind Let's Encrypt's failed-validation limit; don't restart in a loop |
+| ACME fails at cutover | Restart Caddy after each record resolves. Mind Let's Encrypt's failed-validation limit; don't restart in a loop |
+| HSTS-holding browsers see a certificate error during the apex move | Move the apex at a quiet hour, restart Caddy as soon as it resolves. Caddy keeps Vercel's `max-age=63072000` |
 | Container doesn't start after an app change | Roll back by `TAG`; check the app supports every flag in `compose.prod.yaml` |
 | `deploy` user is root-equivalent (docker group) | Reachable only over the tailnet, by `tag:ci`, per the SSH policy |
 
