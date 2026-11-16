@@ -312,7 +312,8 @@ compose config --quiet
 
 running_tag() {
   local id
-  id=$(compose ps -q portfolio 2>/dev/null || true)
+  # -a: a stopped container still records the release to keep.
+  id=$(compose ps -a -q portfolio 2>/dev/null || true)
   [[ -n ${id} ]] || return 0
   docker inspect -f '{{.Config.Image}}' "${id}" | sed -n 's|^.*:\([^:/]*\)$|\1|p'
 }
@@ -329,6 +330,9 @@ if [[ ${START_STACK} == 1 ]]; then
   compose up -d --remove-orphans --wait --wait-timeout 180
   fingerprint=$("${APP_DIR}/fingerprint.sh" | awk '/\(ED25519\)/ {print $1}')
   stack=started
+elif [[ -n $(compose ps -q 2>/dev/null || true) ]]; then
+  log "START_STACK=0: not starting anything; the stack was already running and stays up"
+  stack=held
 else
   log "START_STACK=0: leaving the stack stopped"
   stack=held

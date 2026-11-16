@@ -163,7 +163,7 @@ What `azure.sh` does, in order:
 
 The auth key never appears in output, in the repo or on a command line. It travels in the run-command script, from a mode-0600 temp file on your laptop that is deleted on exit. On the VM the script writes it to a mode-0600 file in a private temp dir, and `bootstrap.sh` unsets every key variable before apt or dpkg runs, passes the file with `tailscale up --auth-key=file:PATH` (Tailscale 1.22 or later; bootstrap checks) and deletes it. The Azure agent keeps a root-only copy of the script on the VM, which is why the key must be one-off.
 
-**Re-running.** `azure.sh` is idempotent. Re-run it after changing anything in `deploy/`; CI does not sync those files. A re-run keeps the running release unless you set `TAG`, and needs no auth key once the VM is on the tailnet.
+**Re-running.** `azure.sh` is idempotent. Re-run it after changing anything in `deploy/`; CI does not sync those files. A re-run keeps the current release, even if its container is stopped, unless you set `TAG`, and needs no auth key once the VM is on the tailnet. Once the NSG rule exists, a failed re-run leaves it in place and says so; `--no-start` on a running VM starts nothing new but doesn't stop the stack or close the NSG either (the script prints the `az network nsg rule delete` command if you want the ports closed).
 
 ### Check the VM
 

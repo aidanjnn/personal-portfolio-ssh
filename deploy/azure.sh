@@ -295,6 +295,15 @@ for f in ${DEPLOY_FILES}; do
   [[ -f ${DEPLOY_DIR}/${f} ]] || die "missing ${DEPLOY_DIR}/${f}"
 done
 
+# On a re-run the allow rule may already exist; the messages below must say so.
+nsg_open=0
+if exists az network nsg rule show -g "${RG}" --nsg-name "${NSG}" -n "${NSG_RULE}"; then
+  nsg_open=1
+  nsg_state="the NSG is unchanged and still admits TCP ${PUBLIC_TCP_PORTS} from an earlier run"
+else
+  nsg_state="the NSG stays closed"
+fi
+
 log "Bootstrap through run-command (a few minutes; output arrives at the end)"
 payload=$(mktemp "${TMPDIR:-/tmp}/portfolio-bootstrap.XXXXXX")
 trap 'rm -f "${payload}"' EXIT
@@ -307,7 +316,7 @@ fi
 
 out=$(run az vm run-command invoke -g "${RG}" -n "${VM}" --command-id RunShellScript \
   --scripts "@${payload}" --query 'value[0].message' -o tsv) \
-  || die "run-command failed; the NSG stays closed"
+  || die "run-command failed; ${nsg_state}"
 
 open_nsg=0
 if [[ ${dry_run} == 1 ]]; then
@@ -318,17 +327,18 @@ else
   [[ -z ${ts_authkey} ]] || out=${out//"${ts_authkey}"/<redacted>}
   printf '%s\n' "${out}" >&2
   grep -q '^BOOTSTRAP_OK ' <<<"${out}" \
-    || die "bootstrap did not report BOOTSTRAP_OK; the NSG stays closed (docs/DEPLOYMENT.md, \"Troubleshooting\")"
+    || die "bootstrap did not report BOOTSTRAP_OK; ${nsg_state} (docs/DEPLOYMENT.md, \"Troubleshooting\")"
   if grep -q '^BOOTSTRAP_OK stack=started' <<<"${out}"; then open_nsg=1; fi
 fi
 
 # --- Open the public ports -----------------------------------------------------
 
 if [[ ${open_nsg} == 1 ]]; then
-  log "Allowing TCP ${PUBLIC_TCP_PORTS} from the Internet"
-  if exists az network nsg rule show -g "${RG}" --nsg-name "${NSG}" -n "${NSG_RULE}"; then
+  if [[ ${nsg_open} == 1 ]]; then
+    log "Allowing TCP ${PUBLIC_TCP_PORTS} from the Internet (refreshing the existing rule)"
     verb=update
   else
+    log "Allowing TCP ${PUBLIC_TCP_PORTS} from the Internet"
     verb=create
   fi
   # shellcheck disable=SC2086 # the port list splits into separate arguments on purpose
@@ -337,6 +347,10 @@ if [[ ${open_nsg} == 1 ]]; then
     --source-address-prefixes Internet --source-port-ranges '*' \
     --destination-address-prefixes '*' --destination-port-ranges ${PUBLIC_TCP_PORTS} \
     --description "portfolio SSH (22, 2222) and Caddy redirect (80, 443)" --output none
+elif [[ ${nsg_open} == 1 ]]; then
+  note "Stack held (--no-start): bootstrap started nothing, but rule ${NSG_RULE} from an earlier run"
+  note "still admits TCP ${PUBLIC_TCP_PORTS}. A stack that was already running keeps running. To close"
+  note "the ports: az network nsg rule delete -g ${RG} --nsg-name ${NSG} -n ${NSG_RULE}"
 else
   note "Stack held (--no-start): the NSG stays closed. Restore the host key, then re-run without --no-start."
 fi
