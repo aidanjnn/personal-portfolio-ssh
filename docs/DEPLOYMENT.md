@@ -269,7 +269,12 @@ If the VM drops off the tailnet (node removed, state lost), delete any leftover 
 
 **2. Serial console**, for an interactive shell while the agent still works but networking or Tailscale doesn't. It needs boot diagnostics (`azure.sh` enables it) and a password, which the VM does not have. `az vm user update` sets one through the VMAccess extension, which needs the same agent as Run Command, so this is no help once the agent is down:
 
-1. Set a temporary one: `az vm user update -g portfolio -n portfolio -u azureuser -p '<temporary>'`.
+1. Set a temporary one. Read it without echoing it, so it stays out of your shell history and off the command line you type (bash or zsh):
+   ```sh
+   printf 'Temporary azureuser password: '; read -rs AZUREUSER_PW; echo
+   az vm user update -g portfolio -n portfolio -u azureuser -p "$AZUREUSER_PW"
+   unset AZUREUSER_PW
+   ```
 2. Portal → `portfolio` VM → Help → Serial console. Log in as `azureuser`, then `sudo -i`.
 3. Afterwards, lock it again: run `passwd -l azureuser` through Run Command.
 
