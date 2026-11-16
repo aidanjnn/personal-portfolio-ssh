@@ -17,6 +17,11 @@ const URL_LIMIT: usize = 2048;
 /// Expanded Work rows live in a `u64` bitset (`App::expanded`), so this cannot exceed 64.
 pub const MAX_LIST_ENTRIES: usize = 64;
 const _: () = assert!(MAX_LIST_ENTRIES <= u64::BITS as usize);
+/// Intro paragraphs, and spans in one paragraph.
+const MAX_INTRO_PARAGRAPHS: usize = 16;
+const MAX_INTRO_SPANS: usize = 64;
+/// Sections in one thought; unlike the lists above, a thought may have none.
+const MAX_THOUGHT_SECTIONS: usize = 32;
 
 /// Content that passed `PortfolioData::validate`. The field is private and the type does not
 /// implement `Deserialize`, so `from_json`, `bundled` and `new` are the only ways to get one, and
@@ -187,10 +192,10 @@ impl PortfolioData {
         }
         validate_text("name", &self.name, SHORT_TEXT_LIMIT)?;
         validate_url("web", &self.web)?;
-        validate_count("intro", self.intro.len(), 16)?;
+        validate_count("intro", self.intro.len(), MAX_INTRO_PARAGRAPHS)?;
         for (index, paragraph) in self.intro.iter().enumerate() {
             let field = format!("intro[{index}]");
-            validate_count(&field, paragraph.len(), 64)?;
+            validate_count(&field, paragraph.len(), MAX_INTRO_SPANS)?;
             for (span_index, span) in paragraph.iter().enumerate() {
                 let field = format!("{field}[{span_index}]");
                 validate_span_text(&format!("{field}.text"), &span.text)?;
@@ -243,9 +248,9 @@ impl PortfolioData {
                 &thought.subtitle,
                 BODY_TEXT_LIMIT,
             )?;
-            if thought.sections.len() > 32 {
+            if thought.sections.len() > MAX_THOUGHT_SECTIONS {
                 return Err(ContentError(format!(
-                    "{field}.sections must contain at most 32 entries"
+                    "{field}.sections must contain at most {MAX_THOUGHT_SECTIONS} entries"
                 )));
             }
             for (section_index, section) in thought.sections.iter().enumerate() {
@@ -812,6 +817,34 @@ mod tests {
             sections["items"]["properties"]["items"]["maxItems"],
             MAX_LIST_ENTRIES
         );
+        assert_eq!(sections["maxItems"], MAX_THOUGHT_SECTIONS);
+        assert_eq!(
+            sections.get("minItems"),
+            None,
+            "a thought may have no sections"
+        );
+        assert_eq!(properties["intro"]["maxItems"], MAX_INTRO_PARAGRAPHS);
+        assert_eq!(properties["intro"]["items"]["maxItems"], MAX_INTRO_SPANS);
+        // Rust enforces each bound exactly: the limit passes and one more fails.
+        let data = bundled_data();
+        let mut paragraphs = data.clone();
+        paragraphs.intro = vec![data.intro[0].clone(); MAX_INTRO_PARAGRAPHS];
+        assert!(paragraphs.validate().is_ok());
+        paragraphs.intro.push(data.intro[0].clone());
+        assert!(paragraphs.validate().is_err());
+        let mut spans = data.clone();
+        spans.intro[0] = vec![data.intro[0][0].clone(); MAX_INTRO_SPANS];
+        assert!(spans.validate().is_ok());
+        spans.intro[0].push(data.intro[0][0].clone());
+        assert!(spans.validate().is_err());
+        let mut thoughts = data.clone();
+        let section = data.thoughts[0].sections[0].clone();
+        thoughts.thoughts[0].sections = vec![section.clone(); MAX_THOUGHT_SECTIONS];
+        assert!(thoughts.validate().is_ok());
+        thoughts.thoughts[0].sections.push(section);
+        assert!(thoughts.validate().is_err());
+        thoughts.thoughts[0].sections.clear();
+        assert!(thoughts.validate().is_ok());
         let snapshot: serde_json::Value = serde_json::from_str(BUNDLED_JSON).unwrap();
 
         // Every object in the contract: the schema requires exactly the properties it declares
