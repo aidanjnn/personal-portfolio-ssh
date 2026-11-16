@@ -129,7 +129,10 @@
         "text": { "type": "string", "minLength": 1, "maxLength": 2048 },
         "style": { "enum": ["plain", "strong", "emphasis", "accent", "highlight"] },
         "url": { "oneOf": [{ "$ref": "#/$defs/url" }, { "type": "null" }] }
-      }
+      },
+      "$comment": "A linked span is a focus stop and titles the link sheet, so its text must be visible.",
+      "if": { "required": ["url"], "properties": { "url": { "type": "string" } } },
+      "then": { "properties": { "text": { "pattern": "\\S" } } }
     }
   }
 }

@@ -2,6 +2,7 @@ use std::{error::Error, fmt, ops::Deref};
 
 use serde::{Deserialize, Serialize};
 use unicode_properties::{GeneralCategory, UnicodeEmoji, UnicodeGeneralCategory};
+use unicode_width::UnicodeWidthChar;
 
 pub const BUNDLED_JSON: &str = include_str!("../content/portfolio.json");
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
@@ -184,9 +185,15 @@ impl PortfolioData {
                 validate_span_text(&format!("{field}.text"), &span.text)?;
                 if let Some(url) = &span.url {
                     validate_url(&format!("{field}.url"), url)?;
+                    // A link is a focus stop and titles its sheet, so it must draw something.
+                    if !has_visible_text(&span.text) {
+                        return Err(ContentError(format!(
+                            "{field}.text must be visible because the span is a link"
+                        )));
+                    }
                 }
             }
-            if paragraph.iter().all(|span| span.text.trim().is_empty()) {
+            if !paragraph.iter().any(|span| has_visible_text(&span.text)) {
                 return Err(ContentError(format!("{field} has no visible text")));
             }
         }
@@ -294,8 +301,14 @@ fn validate_count(field: &str, count: usize, maximum: usize) -> Result<(), Conte
     Ok(())
 }
 
+/// Whether `text` draws at least one glyph: whitespace and zero-width marks alone do not.
+fn has_visible_text(text: &str) -> bool {
+    text.chars()
+        .any(|ch| !ch.is_whitespace() && ch.width().is_some_and(|width| width > 0))
+}
+
 fn validate_text(field: &str, text: &str, maximum: usize) -> Result<(), ContentError> {
-    if text.trim().is_empty() || text.chars().count() > maximum {
+    if !has_visible_text(text) || text.chars().count() > maximum {
         return Err(ContentError(format!(
             "{field} must contain 1–{maximum} visible characters"
         )));
@@ -549,6 +562,32 @@ mod tests {
         ] {
             assert!(validate_text("t", text, 64).is_err(), "accepted {text:?}");
         }
+    }
+
+    #[test]
+    fn linked_spans_need_visible_text() {
+        for text in [" ", "\u{3000}", "\u{301}", "  \u{301} "] {
+            let mut content = bundled_data();
+            let span = content.intro[1]
+                .iter_mut()
+                .find(|span| span.url.is_some())
+                .unwrap();
+            span.text = text.into();
+            assert!(content.validate().is_err(), "accepted link text {text:?}");
+        }
+        // Unlinked spans may still be bare joins such as ", " or " ".
+        let mut content = bundled_data();
+        content.intro[0].push(Span {
+            text: " ".into(),
+            style: SpanStyle::Plain,
+            url: None,
+        });
+        assert!(content.validate().is_ok());
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../content/portfolio.schema.json")).unwrap();
+        let span = &schema["$defs"]["span"];
+        assert_eq!(span["if"]["properties"]["url"]["type"], "string");
+        assert_eq!(span["then"]["properties"]["text"]["pattern"], "\\S");
     }
 
     #[test]
