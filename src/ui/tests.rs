@@ -521,6 +521,47 @@ fn reader_opens_scrolls_and_returns() {
 }
 
 #[test]
+fn the_end_of_a_reader_longer_than_u16_rows_is_reachable() {
+    use crate::content::{ThoughtItem, ThoughtSection};
+    let filler = "lorem ".repeat(170);
+    let content = edited(|data| {
+        data.thoughts[0].sections = (0..32)
+            .map(|section| ThoughtSection {
+                heading: format!("Section {section}"),
+                items: (0..64)
+                    .map(|item| ThoughtItem {
+                        text: format!("{filler}end-{section}-{item}"),
+                        url: Some(format!("https://example.com/{section}/{item}")),
+                    })
+                    .collect(),
+            })
+            .collect();
+    });
+    let mut app = App::default();
+    key(&mut app, KeyCode::Char('t'));
+    render(&mut app, &content, 32, 10);
+    key(&mut app, KeyCode::Enter);
+    render(&mut app, &content, 32, 10);
+    key(&mut app, KeyCode::End);
+    let rows = dump(&render(&mut app, &content, 32, 10));
+    assert!(app.max_scroll > usize::from(u16::MAX), "{}", app.max_scroll);
+    assert_eq!(app.scroll, app.max_scroll);
+    assert!(
+        rows.iter().any(|row| row.contains("end-31-63")),
+        "{rows:#?}"
+    );
+    // Focus from the bottom lands on the last link, and it is on screen.
+    key(&mut app, KeyCode::BackTab);
+    render(&mut app, &content, 32, 10);
+    let index = app.focus.expect("a link is focused");
+    assert_eq!(index, 32 * 64 - 1);
+    let item = app.items[index];
+    // The link is taller than the viewport, so its first row is revealed.
+    assert_eq!(app.scroll, item.top);
+    assert!(item.top > usize::from(u16::MAX));
+}
+
+#[test]
 fn leaving_a_page_resets_focus_and_scroll() {
     let content = content();
     let mut app = App::default();

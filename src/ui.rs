@@ -585,8 +585,7 @@ fn draw_scrollbar(buf: &mut Buffer, layout: &Layout, app: &App, total: usize, pa
     }
     let view = usize::from(layout.view_h);
     let thumb = (view * view / total.max(1)).clamp(1, view);
-    let pos = (usize::from(app.scroll) * (view - thumb) + usize::from(app.max_scroll) / 2)
-        / usize::from(app.max_scroll);
+    let pos = (app.scroll * (view - thumb) + app.max_scroll / 2) / app.max_scroll;
     for row in 0..view {
         let (glyph, style) = if (pos..pos + thumb).contains(&row) {
             ("┃", pal.faint())
@@ -731,7 +730,7 @@ fn status<'a>(
     if more && !layout.compact {
         let prefix = match app.page {
             Page::Reader(_) => {
-                let shown = (usize::from(app.scroll) + usize::from(layout.view_h)) * 100;
+                let shown = (app.scroll + usize::from(layout.view_h)) * 100;
                 format!("↓ {}%  ·  ", (shown / doc.lines.len().max(1)).min(100))
             }
             _ => "↓ more  ·  ".to_string(),
@@ -1068,8 +1067,8 @@ fn settle<'a>(
         .items
         .iter()
         .map(|item| ItemRows {
-            top: item.top.min(usize::from(u16::MAX)) as u16,
-            bottom: item.bottom.min(usize::from(u16::MAX)) as u16,
+            top: item.top,
+            bottom: item.bottom,
         })
         .collect();
     app.focus = match app.focus {
@@ -1077,27 +1076,22 @@ fn settle<'a>(
         Some(index) => Some(index.min(doc.items.len() - 1)),
         None => None,
     };
-    app.viewport = layout.view_h;
+    app.viewport = usize::from(layout.view_h);
     let view = usize::from(layout.view_h);
-    app.max_scroll = doc
-        .lines
-        .len()
-        .saturating_sub(view)
-        .min(usize::from(u16::MAX)) as u16;
+    app.max_scroll = doc.lines.len().saturating_sub(view);
     let revealed = app.reveal;
     if app.reveal {
         app.reveal = false;
         if let Some(item) = app.focus.map(|index| doc.items[index]) {
-            let scroll = usize::from(app.scroll);
-            if item.top < scroll || item.bottom - item.top >= view {
-                app.scroll = item.top.min(usize::from(u16::MAX)) as u16;
-            } else if item.bottom >= scroll + view {
-                app.scroll = (item.bottom + 1 - view) as u16;
+            if item.top < app.scroll || item.bottom - item.top >= view {
+                app.scroll = item.top;
+            } else if item.bottom >= app.scroll + view {
+                app.scroll = item.bottom + 1 - view;
             }
         }
     }
     app.scroll = app.scroll.min(app.max_scroll);
-    let scroll = usize::from(app.scroll);
+    let scroll = app.scroll;
     // In the Reader, a link scrolled fully out of view is no longer focused.
     if let (Page::Reader(_), Some(index), false) = (app.page, app.focus, revealed) {
         let item = doc.items[index];
@@ -1129,7 +1123,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, content: &Portfolio) {
         return;
     };
     let view = usize::from(layout.view_h);
-    let scroll = usize::from(app.scroll);
+    let scroll = app.scroll;
     let focused = app.focus.map(|index| doc.items[index]);
 
     draw_birds(buf, &layout, &pal);

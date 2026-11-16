@@ -38,8 +38,8 @@ pub enum Sheet {
 /// A focusable element's rows in page coordinates, captured by the last draw.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ItemRows {
-    pub top: u16,
-    pub bottom: u16,
+    pub top: usize,
+    pub bottom: usize,
 }
 
 /// A hyperlink as drawn: the cells it covers, re-emitted with OSC 8 by `ui::link_escapes`.
@@ -56,9 +56,9 @@ pub struct App {
     pub theme: Theme,
     pub quit: bool,
     /// Vertical scroll of the page viewport, in rows.
-    pub scroll: u16,
+    pub scroll: usize,
     /// Recomputed by `ui::draw`.
-    pub max_scroll: u16,
+    pub max_scroll: usize,
     pub page: Page,
     pub focus: Option<usize>,
     /// Expanded Work rows, one bit per row; read it with `is_expanded`.
@@ -74,7 +74,7 @@ pub struct App {
     pub clipboard: Option<String>,
     pub hyperlinks: Vec<Hyperlink>,
     /// Layout facts from the last draw, used to resolve keys.
-    pub viewport: u16,
+    pub viewport: usize,
     pub items: Vec<ItemRows>,
 }
 
@@ -212,13 +212,12 @@ impl App {
         }
     }
 
-    fn page_step(&self) -> i32 {
-        i32::from(self.viewport.saturating_sub(1).max(1))
+    fn page_step(&self) -> isize {
+        isize::try_from(self.viewport.saturating_sub(1).max(1)).unwrap_or(isize::MAX)
     }
 
-    fn scroll_by(&mut self, rows: i32) {
-        let next = (i32::from(self.scroll) + rows).clamp(0, i32::from(self.max_scroll));
-        self.scroll = next as u16;
+    fn scroll_by(&mut self, rows: isize) {
+        self.scroll = self.scroll.saturating_add_signed(rows).min(self.max_scroll);
     }
 
     /// Moves focus to the next or previous item. Returns false when there is none.
