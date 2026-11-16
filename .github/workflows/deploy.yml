@@ -4,7 +4,8 @@ name: Deploy
 # GHCR (or, if the tag's image already exists, reuses it without testing or
 # building), then, when the DEPLOY_ENABLED repository variable is 'true',
 # rolls its digest out to the Azure VM over Tailscale SSH, rolling back if it
-# doesn't become healthy. Runbook: docs/DEPLOYMENT.md.
+# doesn't become healthy. Only then does :latest move to it, so :latest is
+# always the last healthy release. Runbook: docs/DEPLOYMENT.md.
 # It never syncs deploy/: re-run deploy/azure.sh after changing those files.
 #
 # Runs only for v* tags: on a tag push, or from "Run workflow" with a v* tag
@@ -26,7 +27,8 @@ on:
   push:
     tags:
       - "v*"
-  # Pick an existing v* tag under "Use workflow from". Also moves :latest to it.
+  # Pick an existing v* tag under "Use workflow from". Moves :latest to it once
+  # it is healthy, so this is also the rollback.
   workflow_dispatch:
 
 permissions: {}
@@ -157,12 +159,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Point :latest at the existing image
-        if: needs.resolve.outputs.exists == 'true'
-        env:
-          DIGEST: ${{ needs.resolve.outputs.digest }}
-        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
-
       - name: Build and push
         id: build
         if: needs.resolve.outputs.exists == 'false'
@@ -171,9 +167,9 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
-            ${{ env.IMAGE }}:latest
+          # Only the release tag: :latest moves in the promote job, once the
+          # release is healthy.
+          tags: ${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
@@ -310,3 +306,35 @@ jobs:
               exit 1
             fi
           done
+
+  # :latest is the last healthy release. It moves only after the rollout passed
+  # its health gate, or, with deploys off, once the image is built or found.
+  # A failed or rolled-back deploy leaves it where it was.
+  promote:
+    name: Move :latest
+    needs: [resolve, image, deploy]
+    if: ${{ !cancelled() && needs.image.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point :latest at the release
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No image digest from the image job"
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+          echo ":latest is now $TAG ($IMAGE@$DIGEST)"
