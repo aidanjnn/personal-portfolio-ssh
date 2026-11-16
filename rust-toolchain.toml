@@ -1,0 +1,6 @@
+# Clippy adds lints in new releases, so local runs and CI only agree when they
+# use the same toolchain. rustup installs this one on first use.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

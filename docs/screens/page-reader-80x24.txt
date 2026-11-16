@@ -1,0 +1,24 @@
+
+       Aidan Jeon    996    Projects    Thoughts
+
+       2026                                                               ┃
+       misc.                                                              ┃
+       my entire life-stack                                               ┃
+                                                                          ┃
+       productivity stack                                                 ┃
+         dia (considering aside)                                          ┃
+         wisprflow (my coworkers put me on)                               │
+         notion (ever since grade 8)                                      │
+         poke (negotiated it down to 0.50 c/m)                            │
+         paper                                                            │
+         cap (open-source screen studio)                                  │
+         raycast                                                          │
+         rectangle                                                        │
+                                                                          │
+       devtools                                                           │
+         cloud-based agents: devin                                        │
+         zed, cursor (for design)                                         │
+
+       © Aidan Jeon 2026                                            ← ◇ →
+
+       j k scroll   esc back to Thoughts      ↓ 36%  ·  ? keys  ·  q quit

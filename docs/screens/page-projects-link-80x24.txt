@@ -1,0 +1,24 @@
+
+       Aidan Jeon    996    Projects    Thoughts
+
+       Projects
+
+       2026  teachAR (Hack the North)
+             AR tutor for learning physical skills through recorded ghost
+             hands & an AI coach
+
+     › 2026  Otto
+             Voice agent automating GitHub, Gmail, & G-Cal via natural
+             speech. Won 1st place at NexHacks at CMU (1500+ hackers)
+             (Best use of LiveKit — $1000 + internship).
+
+       2026  Toothfairy
+             Cursor for dentists, streamlining dental workflows
+
+       2026  Sketchy
+             Draw wireframes & deploy to Vercel in <60 seconds
+
+       ┌─ Otto ─────────────────────────────────────────────────────────┐
+       │ https://github.com/abrj7/otto           cmd/ctrl-click to open │
+       └────────────────────────────────────────────────────────────────┘
+       ↵/esc close   c copy link                        ? keys  ·  q quit
