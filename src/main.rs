@@ -10,7 +10,7 @@ mod ui;
 use crossterm::event::{self, Event};
 use std::{
     ffi::OsStr,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     time::Duration,
 };
 
@@ -20,9 +20,23 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n  personal-portfolio-tui serve [OPTIONS]\n\nServer options:\n  --bind ADDRESS           Listen address (default 127.0.0.1:2222)\n  --host-key PATH          Persistent Ed25519 key (default data/ssh_host_ed25519_key)\n  --max-sessions COUNT     Concurrent connections, 1–256 (default 32)\n  --max-per-ip COUNT       Concurrent connections per client address, 1–32 (default 3)\n  --idle-timeout SECS      Input inactivity timeout, 1–3600 (default 300)\n  --max-session-secs SECS  Hard session length, 60–86400 (default 1800)\n  --content-url URL        HTTPS portfolio.json to refresh from, at most once a minute\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nAnonymous SSH only runs the portfolio. PTY required; no commands or forwarding.\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
+            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n  personal-portfolio-tui --check-content FILE|-\n  personal-portfolio-tui serve [OPTIONS]\n\nServer options:\n  --bind ADDRESS           Listen address (default 127.0.0.1:2222)\n  --host-key PATH          Persistent Ed25519 key (default data/ssh_host_ed25519_key)\n  --max-sessions COUNT     Concurrent connections, 1–256 (default 32)\n  --max-per-ip COUNT       Concurrent connections per client address, 1–32 (default 3)\n  --idle-timeout SECS      Input inactivity timeout, 1–3600 (default 300)\n  --max-session-secs SECS  Hard session length, 60–86400 (default 1800)\n  --content-url URL        HTTPS portfolio.json to refresh from, at most once a minute\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nAnonymous SSH only runs the portfolio. PTY required; no commands or forwarding.\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
         );
         return Ok(());
+    }
+    if let [flag, path] = args.as_slice()
+        && flag == "--check-content"
+    {
+        return match read_snapshot(path).and_then(|raw| check_content(&raw)) {
+            Ok(summary) => {
+                println!("{summary}");
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("invalid portfolio content: {error}");
+                std::process::exit(1);
+            }
+        };
     }
     let content = content::Portfolio::bundled()?;
     if args == ["--print-content"] {
@@ -55,6 +69,38 @@ fn main() -> Result<(), Error> {
     // The restored terminal translates newlines itself.
     println!("\n{}", ui::goodbye(&content.web));
     Ok(())
+}
+
+/// Reads a snapshot from a file, or stdin for `-`, stopping one byte past the size cap.
+fn read_snapshot(path: &str) -> Result<Vec<u8>, Error> {
+    let limit = content::MAX_SNAPSHOT_BYTES as u64 + 1;
+    let mut raw = Vec::new();
+    if path == "-" {
+        io::stdin().take(limit).read_to_end(&mut raw)?;
+    } else {
+        std::fs::File::open(path)?
+            .take(limit)
+            .read_to_end(&mut raw)?;
+    }
+    Ok(raw)
+}
+
+/// Validates a snapshot exactly as the server does before serving fetched content.
+/// The website's CI runs this against the `/portfolio.json` it is about to deploy.
+fn check_content(raw: &[u8]) -> Result<String, Error> {
+    if raw.len() > content::MAX_SNAPSHOT_BYTES {
+        return Err(format!("larger than {} bytes", content::MAX_SNAPSHOT_BYTES).into());
+    }
+    let json = std::str::from_utf8(raw).map_err(|_| "not UTF-8")?;
+    let portfolio = content::Portfolio::from_json(json)?;
+    Ok(format!(
+        "portfolio.json OK: v{}, {} bytes, {} work, {} projects, {} thoughts",
+        portfolio.version,
+        raw.len(),
+        portfolio.work.len(),
+        portfolio.projects.len(),
+        portfolio.thoughts.len()
+    ))
 }
 
 fn parse_server_args(args: &[String]) -> Result<ssh::Config, Error> {
@@ -190,6 +236,24 @@ mod tests {
                 "accepted {url:?}"
             );
         }
+    }
+
+    #[test]
+    fn check_content_accepts_the_bundled_snapshot_and_rejects_bad_input() {
+        let bundled = include_bytes!("../content/portfolio.json");
+        assert!(
+            check_content(bundled)
+                .unwrap()
+                .starts_with("portfolio.json OK: v2")
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(bundled).unwrap();
+        json["work"][0]["logo"] = "x".into();
+        assert!(check_content(json.to_string().as_bytes()).is_err());
+        json["work"][0].as_object_mut().unwrap().remove("logo");
+        json["work"][0]["url"] = "/work".into();
+        assert!(check_content(json.to_string().as_bytes()).is_err());
+        assert!(check_content(&[0xff, 0xfe]).is_err());
+        assert!(check_content(&vec![b' '; content::MAX_SNAPSHOT_BYTES + 1]).is_err());
     }
 
     #[test]

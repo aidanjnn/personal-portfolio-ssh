@@ -2,16 +2,18 @@
 
 The website is the source of truth. Its build serves `https://www.aidanjeon.com/portfolio.json`, generated from its own `content/*.ts`. The SSH server bundles a snapshot of that file (`content/portfolio.json`) and, when started with `--content-url`, refreshes it from the website: at most once a minute, with a 2 s timeout, keeping the last good copy. A visitor never waits on the network. Each session keeps the snapshot it started with.
 
-To change copy, edit the website. Refresh the bundled fallback when convenient:
+To change copy, edit the website. Its CI validates the `/portfolio.json` it is about to deploy with this server's own validator (`--check-content`, run from the published image), so a content edit the server would reject fails the website's build instead of silently freezing the SSH portfolio on its last good copy.
+
+Check a file by hand, or refresh the bundled fallback when convenient:
 
 ```sh
-cd ../personalportfolio && npm run export:portfolio > ../personal-portfolio-tui-explorer/content/portfolio.json
-cargo test --locked
+cargo run --locked -- --check-content path/to/portfolio.json   # or - for stdin
+curl -fsS https://www.aidanjeon.com/portfolio.json > content/portfolio.json && cargo test --locked
 ```
 
 ## Contract v2
 
-[`content/portfolio.schema.json`](../content/portfolio.schema.json) (JSON Schema 2020-12) is the contract. `Portfolio::from_json` in `src/content.rs` enforces the same shape and limits, rejects unknown fields and versions other than 2, caps snapshots at 1 MiB, and rejects control, bidi-override and zero-width characters, so fetched text can't inject terminal escapes.
+[`content/portfolio.schema.json`](../content/portfolio.schema.json) (JSON Schema 2020-12) documents the contract; it lives only in this repo, next to the validator. A test keeps its limits and required fields in step with `src/content.rs`. `Portfolio::from_json` in `src/content.rs` enforces the same shape and limits, rejects unknown fields and versions other than 2, caps snapshots at 1 MiB, and rejects control, bidi-override and zero-width characters, so fetched text can't inject terminal escapes.
 
 | Field | Shape |
 | --- | --- |
