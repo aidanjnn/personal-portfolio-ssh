@@ -1,0 +1,142 @@
+name: Deploy
+
+# Builds the linux/amd64 image for a release tag, pushes it to GHCR, and,
+# when the DEPLOY_ENABLED repository variable is 'true', rolls it out to the
+# Azure VM over Tailscale SSH. Runbook: docs/DEPLOYMENT.md.
+# It never syncs deploy/: re-run deploy/azure.sh after changing those files.
+#
+# Repository variables: DEPLOY_ENABLED, DEPLOY_HOST (tailnet hostname),
+#   DEPLOY_USER (default deploy), PUBLIC_HOST (default ssh.aidanjeon.com),
+#   HOST_KEY_FINGERPRINT (optional, SHA256:...)
+# Secrets: TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing git tag to build and deploy, e.g. v0.1.0. Also moves :latest.
+        required: true
+        type: string
+
+permissions: {}
+
+# One rollout at a time; never cancel one halfway.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/aidanjnn/personal-portfolio-ssh
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # The tag ends up in an image reference and a remote shell command.
+          if [[ ! "$TAG" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            echo "::error::Tag '$TAG' must start with v and contain only [0-9A-Za-z._-]"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VM
+    needs: build
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+    environment:
+      name: production
+      url: https://aidanjeon.com
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+      PUBLIC_HOST: ${{ vars.PUBLIC_HOST || 'ssh.aidanjeon.com' }}
+      EXPECTED_FINGERPRINT: ${{ vars.HOST_KEY_FINGERPRINT }}
+    steps:
+      - name: Join tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Pull and restart on the VM
+        run: |
+          if [[ -z "$DEPLOY_HOST" ]]; then
+            echo "::error::Repository variable DEPLOY_HOST is not set"
+            exit 1
+          fi
+          # Tailscale SSH: tailscaled on the VM answers port 22 on its tailnet
+          # address (OpenSSH is masked there). The tailnet authenticates both
+          # ends, so there is no client key, and accept-new only records the
+          # node's host key. If Tailscale SSH were off, this would reach the
+          # portfolio instead, which rejects exec, so the step fails safely.
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd /opt/portfolio && TAG=${TAG} docker compose -f compose.prod.yaml pull && TAG=${TAG} docker compose -f compose.prod.yaml up -d"
+
+      - name: Smoke test public SSH
+        run: |
+          # Both ports must serve the portfolio's key: 22 is the advertised path and
+          # 2222 the fallback for networks that block outbound 22. Either failing fails the job.
+          for port in 2222 22; do
+            key=""
+            for _ in $(seq 1 10); do
+              key=$(ssh-keyscan -T 5 -t ed25519 -p "$port" "$PUBLIC_HOST" 2>/dev/null | grep ' ssh-ed25519 ' || true)
+              [[ -n "$key" ]] && break
+              sleep 3
+            done
+            if [[ -z "$key" ]]; then
+              echo "::error::No ed25519 host key from $PUBLIC_HOST:$port"
+              exit 1
+            fi
+            fp=$(ssh-keygen -lf - <<<"$key" | awk '{print $2}')
+            echo "$PUBLIC_HOST:$port serves ed25519 $fp"
+            if [[ -n "$EXPECTED_FINGERPRINT" && "$fp" != "$EXPECTED_FINGERPRINT" ]]; then
+              echo "::error::Host key changed on port $port: expected $EXPECTED_FINGERPRINT, got $fp"
+              exit 1
+            fi
+          done

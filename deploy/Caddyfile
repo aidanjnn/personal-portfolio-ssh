@@ -1,0 +1,21 @@
+# Lives at /opt/portfolio/Caddyfile. The website itself is on Vercel at
+# www.aidanjeon.com; this VM only redirects browsers there.
+#
+# Caddy obtains Let's Encrypt certificates automatically once DNS for these
+# names points at the VM, and redirects plain HTTP to HTTPS first.
+# Apply edits with: docker compose -f compose.prod.yaml restart caddy
+
+{
+	# Nothing reconfigures Caddy at runtime, so the admin API stays off.
+	admin off
+
+	# The Azure NSG admits TCP only, so don't advertise HTTP/3 (UDP).
+	# A one-hop redirect gains nothing from it.
+	servers {
+		protocols h1 h2
+	}
+}
+
+aidanjeon.com, ssh.aidanjeon.com {
+	redir https://www.aidanjeon.com{uri} 308
+}
