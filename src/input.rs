@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+const PASTE_END: &[u8] = b"\x1b[201~";
+
 /// SSH packets are transport chunks, not key boundaries.
 #[derive(Default)]
 pub struct Decoder {
@@ -26,11 +28,11 @@ impl Decoder {
     }
 
     pub fn has_escape(&self) -> bool {
-        self.pending == [0x1b]
+        !self.discard_paste && self.pending == [0x1b]
     }
 
     pub fn expire_escape(&mut self) -> Option<KeyEvent> {
-        if self.pending == [0x1b] {
+        if self.has_escape() {
             self.pending.clear();
             Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         } else {
@@ -40,6 +42,18 @@ impl Decoder {
     }
 
     fn decode(&mut self, keys: &mut Vec<KeyEvent>) {
+        if self.discard_paste {
+            // Only the literal end marker leaves a paste, whatever came before it, so a
+            // partial sequence inside the paste cannot hide the marker. Keep just enough of
+            // the tail to recognise a marker split across packets.
+            if self.pending.ends_with(PASTE_END) {
+                self.discard_paste = false;
+                self.pending.clear();
+            } else if self.pending.len() >= PASTE_END.len() {
+                self.pending.remove(0);
+            }
+            return;
+        }
         let first = self.pending[0];
         if first == 0x1b {
             if self.pending.len() == 1 {
@@ -59,9 +73,7 @@ impl Decoder {
                 }
                 if self.pending == b"\x1b[200~" {
                     self.discard_paste = true;
-                } else if self.pending == b"\x1b[201~" {
-                    self.discard_paste = false;
-                } else if !self.discard_paste {
+                } else {
                     let code = match self.pending.as_slice() {
                         b"\x1b[A" | b"\x1bOA" => Some(KeyCode::Up),
                         b"\x1b[B" | b"\x1bOB" => Some(KeyCode::Down),
@@ -86,16 +98,17 @@ impl Decoder {
                 }
                 self.pending.clear();
             } else {
-                // Alt keys are not portfolio commands; swallow the complete pair.
-                self.pending.clear();
+                // A lone Escape followed by anything but a CSI/SS3 introducer is a press of
+                // Escape, then the next key: Esc Esc is two presses and `ESC q` is Esc, q.
+                // Alt chords are not portfolio commands, so splitting them loses nothing.
+                keys.push(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                self.pending.remove(0);
+                self.decode(keys);
             }
             return;
         }
         if first.is_ascii() {
             self.pending.clear();
-            if self.discard_paste {
-                return;
-            }
             let (code, modifiers) = match first {
                 b'\r' | b'\n' => (KeyCode::Enter, KeyModifiers::NONE),
                 b'\t' => (KeyCode::Tab, KeyModifiers::NONE),
@@ -111,26 +124,101 @@ impl Decoder {
         } else {
             match std::str::from_utf8(&self.pending) {
                 Ok(text) => {
-                    if !self.discard_paste {
-                        keys.extend(
-                            text.chars()
-                                .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
-                        );
+                    keys.extend(chars(text));
+                    self.pending.clear();
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    let Some(invalid) = error.error_len() else {
+                        // An incomplete character: wait for the rest of it.
+                        return;
+                    };
+                    // Keep what decoded, drop only the invalid bytes, and decode the rest:
+                    // `C3 q` loses the stray C3, not the q.
+                    let text = std::str::from_utf8(&self.pending[..valid]).unwrap_or_default();
+                    keys.extend(chars(text));
+                    self.pending.drain(..valid + invalid);
+                    if !self.pending.is_empty() {
+                        self.decode(keys);
                     }
-                    self.pending.clear();
                 }
-                Err(error) if error.error_len().is_some() || self.pending.len() >= 4 => {
-                    self.pending.clear();
-                }
-                Err(_) => {}
             }
         }
     }
 }
 
+fn chars(text: &str) -> impl Iterator<Item = KeyEvent> + '_ {
+    text.chars()
+        .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codes(keys: Vec<KeyEvent>) -> Vec<KeyCode> {
+        keys.into_iter().map(|key| key.code).collect()
+    }
+
+    #[test]
+    fn an_invalid_byte_drops_only_itself() {
+        let mut decoder = Decoder::default();
+        assert_eq!(codes(decoder.feed(b"\xc3q")), [KeyCode::Char('q')]);
+        assert_eq!(
+            codes(decoder.feed(b"\xe2\x82q\xffj\xc3\xa9")),
+            [KeyCode::Char('q'), KeyCode::Char('j'), KeyCode::Char('é')]
+        );
+        // A truncated character before an escape sequence still lets the sequence through.
+        assert_eq!(codes(decoder.feed(b"\xf0\x9f\x1b[B")), [KeyCode::Down]);
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn a_lone_escape_before_another_key_is_escape_then_that_key() {
+        let mut decoder = Decoder::default();
+        assert_eq!(
+            codes(decoder.feed(b"\x1b\x1b")),
+            [KeyCode::Esc],
+            "the second Escape waits for its timeout"
+        );
+        assert_eq!(decoder.expire_escape().unwrap().code, KeyCode::Esc);
+        assert_eq!(
+            codes(decoder.feed(b"\x1bq")),
+            [KeyCode::Esc, KeyCode::Char('q')]
+        );
+        assert_eq!(
+            codes(decoder.feed(b"\x1b\x1b\x1b[A\x1b\r")),
+            [
+                KeyCode::Esc,
+                KeyCode::Esc,
+                KeyCode::Up,
+                KeyCode::Esc,
+                KeyCode::Enter
+            ]
+        );
+        // Split across packets, the pair decodes the same way.
+        assert!(decoder.feed(b"\x1b").is_empty());
+        assert_eq!(
+            codes(decoder.feed(b"j")),
+            [KeyCode::Esc, KeyCode::Char('j')]
+        );
+    }
+
+    #[test]
+    fn a_paste_ends_at_its_marker_even_after_a_partial_sequence() {
+        let mut decoder = Decoder::default();
+        assert!(decoder.feed(b"\x1b[200~qq\x1b[12\x1b[201~").is_empty());
+        assert_eq!(codes(decoder.feed(b"k")), [KeyCode::Char('k')]);
+        // A stray Escape inside a paste is not a key, and neither is its timeout.
+        assert!(decoder.feed(b"\x1b[200~q\x1b").is_empty());
+        assert!(!decoder.has_escape());
+        assert!(decoder.expire_escape().is_none());
+        // The end marker may arrive split at any byte.
+        for byte in &b"x\x1b[201~"[..] {
+            assert!(decoder.feed(&[*byte]).is_empty());
+        }
+        assert_eq!(codes(decoder.feed(b"j")), [KeyCode::Char('j')]);
+    }
 
     #[test]
     fn oversized_input_keeps_only_the_first_keys_but_all_of_its_state() {
@@ -234,8 +322,10 @@ mod tests {
                 }
             }
             chunk.truncate(length);
+            // An Escape left over from the previous chunk becomes a key with this one's first byte.
+            let carried = usize::from(decoder.has_escape());
             let keys = decoder.feed(&chunk);
-            assert!(keys.len() <= chunk.len());
+            assert!(keys.len() <= chunk.len() + carried);
             assert!(
                 decoder.pending.len() <= 32,
                 "{} pending",
