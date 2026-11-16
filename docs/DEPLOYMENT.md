@@ -41,7 +41,9 @@ x64, not Arm: the image is built for linux/amd64 only.
 
 **Volumes.** The compose project is named `portfolio`, so volumes are `portfolio_host-key` (the SSH identity), `portfolio_caddy-data` (certificates) and `portfolio_caddy-config`. **Never run `docker compose down -v`.**
 
-**Hardening, both services:** read-only root filesystem, `cap_drop: ALL` (Caddy gets back only `NET_BIND_SERVICE`), `no-new-privileges`, `init`, CPU/memory/PID limits, `json-file` logs capped at 3 × 1 MB, `restart: unless-stopped`. The portfolio runs as UID 10001.
+**Hardening, both services:** read-only root filesystem, `cap_drop: ALL` (Caddy gets back only `NET_BIND_SERVICE`), `no-new-privileges`, `init`, CPU/memory/PID limits, `json-file` logs capped at 3 × 1 MB, `restart: unless-stopped`. The portfolio runs as UID/GID 10001, set both by the Dockerfile's `USER` and by `user: "10001:10001"` in compose.
+
+**Pinned images.** Caddy is pinned to an exact version and index digest in `compose.prod.yaml`, and the Dockerfile's `rust` and `debian` base images are pinned by digest. Each file says how to bump its pin (`docker buildx imagetools inspect <image>:<tag>` prints the digest). After bumping Caddy, re-run `azure.sh`; CI never touches files on the VM.
 
 **Perimeter.** The NSG is the firewall. It starts with Azure's default rules only, so nothing from the Internet gets in while bootstrap runs. The allow rule is added only after bootstrap reports success. There is no host firewall: Docker's published ports bypass ufw, and with OpenSSH off nothing else listens publicly, so ufw would only be a second list to keep in step. The NSG admits no UDP, so Caddy does not offer HTTP/3.
 

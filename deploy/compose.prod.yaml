@@ -30,6 +30,8 @@ services:
   portfolio:
     <<: *hardening
     image: ghcr.io/aidanjnn/personal-portfolio-ssh:${TAG:-latest}
+    # The Dockerfile's USER, stated here too so no image can run as root.
+    user: "10001:10001"
     command:
       - serve
       - --bind
@@ -66,7 +68,11 @@ services:
 
   caddy:
     <<: *hardening
-    image: caddy:2.10
+    # Exact version plus index digest: a re-pull can't change what runs. To
+    # bump, pick a release from hub.docker.com/_/caddy and look up its digest:
+    #   docker buildx imagetools inspect caddy:<version>   # "Digest: sha256:..."
+    # Then re-run deploy/azure.sh (CI never touches this file on the VM).
+    image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
     # The image's caddy binary carries the cap_net_bind_service file
     # capability. With cap_drop: ALL it cannot exec unless the capability
     # stays in the bounding set.

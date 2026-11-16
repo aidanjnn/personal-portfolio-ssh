@@ -1,4 +1,10 @@
-ARG RUST_IMAGE=rust:1-bookworm
+# Base images are pinned by digest, so a rebuild of the same commit uses the
+# same bytes. The tag is for people; the digest is what Docker pulls. To bump
+# one, pick the new tag and look up its index digest:
+#   docker buildx imagetools inspect rust:<version>-bookworm   # "Digest: sha256:..."
+#   docker buildx imagetools inspect debian:bookworm-<date>-slim
+# Keep both stages on the same Debian release so the binary's glibc matches.
+ARG RUST_IMAGE=rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -6,7 +12,7 @@ COPY src ./src
 COPY content ./content
 RUN cargo build --locked --release
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-20261104-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/* \
