@@ -1602,6 +1602,9 @@ mod tests {
     struct Flooded {
         /// Data bytes, or window changes, the client finished sending before the deadline.
         sent: usize,
+        /// Data messages received. Each frame in these tests is one message: they are far
+        /// smaller than a channel packet.
+        messages: usize,
         output: Vec<u8>,
         /// From the start of the flood until the last read.
         elapsed: Duration,
@@ -1660,22 +1663,24 @@ mod tests {
             sent
         };
         let reader = async {
-            let mut output = Vec::new();
+            let (mut messages, mut output) = (0, Vec::new());
             let _ = tokio::time::timeout_at(until + drain, async {
                 while let Some(message) = read.wait().await {
                     if let ChannelMsg::Data { data } = message {
+                        messages += 1;
                         output.extend_from_slice(&data);
                     }
                 }
             })
             .await;
-            output
+            (messages, output)
         };
-        let (sent, output) = tokio::join!(writer, reader);
+        let (sent, (messages, output)) = tokio::join!(writer, reader);
         let elapsed = started.elapsed();
         drop(handle);
         Flooded {
             sent,
+            messages,
             output,
             elapsed,
         }
@@ -2518,6 +2523,53 @@ mod tests {
         visit.read_until(b"Copperlane").await;
         visit.send(b"q").await;
         visit.read_until(b"thanks for stopping by").await;
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_flood_is_drawn_at_most_once_per_frame_interval() {
+        let server = TestServer::start(test_config()).await;
+        // One key per message, many per frame interval, so each could be a frame of its own.
+        let load = Load::Packets {
+            start: b"",
+            packets: vec![b"j".to_vec(), b"k".to_vec()],
+            gap: Duration::from_millis(2),
+        };
+        let seen = flood(server.addr, load, Duration::from_secs(1), DRAIN).await;
+        let frames = seen.messages;
+        let bound = (seen.elapsed.as_millis() / FRAME_INTERVAL.as_millis()) as usize + 1;
+        assert!(
+            seen.sent > 2 * bound,
+            "the flood sent only {} keys",
+            seen.sent
+        );
+        assert!(frames <= bound, "{frames} frames in {:?}", seen.elapsed);
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_flood_is_left_unread_once_the_key_budget_is_spent() {
+        let server = TestServer::start(test_config()).await;
+        // 1 KiB packets of keys with no gap: only the server's reading holds the client back.
+        // The byte budget alone would allow 384 KiB in two seconds; this is the key budget.
+        let packet = 1024;
+        let load = Load::Packets {
+            start: b"",
+            packets: vec![vec![b'j'; packet]],
+            gap: Duration::ZERO,
+        };
+        let seen = flood(server.addr, load, Duration::from_secs(2), Duration::ZERO).await;
+        // Every read spends at least one key, so the server reads the burst's packet and then
+        // one per key refilled. Beyond that the client can only have russh's channel buffer
+        // and receive window in flight. Doubled for timing slack: always reading takes ~1.6 MB.
+        let reads = 2 + (KEYS_PER_SECOND * seen.elapsed.as_secs_f64()) as usize;
+        let bound = 2 * ((reads + 1 + 16) * packet + 65536);
+        assert!(
+            seen.sent <= bound,
+            "{} bytes in {:?}",
+            seen.sent,
+            seen.elapsed
+        );
         server.stop().await;
     }
 
