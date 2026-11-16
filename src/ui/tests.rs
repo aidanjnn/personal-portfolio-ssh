@@ -414,6 +414,61 @@ fn home_scrolls_past_the_last_link_with_j() {
 }
 
 #[test]
+fn scrolling_never_leaves_focus_on_an_off_screen_item() {
+    let content = content();
+    let on_screen = |app: &App| {
+        app.focus.is_none_or(|index| {
+            let item = app.items[index];
+            item.bottom >= app.scroll && item.top < app.scroll + app.viewport
+        })
+    };
+    for page in ['h', 'w', 'p', 't'] {
+        let mut app = App::default();
+        render(&mut app, &content, 40, 10);
+        key(&mut app, KeyCode::Char(page));
+        if page == 'w' || page == 't' {
+            key(&mut app, KeyCode::Enter);
+        }
+        render(&mut app, &content, 40, 10);
+        for code in [
+            KeyCode::End,
+            KeyCode::Char('g'),
+            KeyCode::PageDown,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Char('G'),
+        ] {
+            key(&mut app, code);
+            let rows = dump(&render(&mut app, &content, 40, 10));
+            assert!(on_screen(&app), "{page} after {code:?}: {:?}", app.focus);
+            if app.focus.is_none() {
+                assert!(
+                    !rows[9].contains('↗'),
+                    "{page} after {code:?}: {:?}",
+                    rows[9]
+                );
+            }
+        }
+    }
+    // Projects at the bottom: the first project scrolled away, so Enter opens no sheet,
+    // and k picks up the last project on screen instead of jumping back to the top.
+    let mut app = App::default();
+    key(&mut app, KeyCode::Char('p'));
+    render(&mut app, &content, 40, 10);
+    key(&mut app, KeyCode::End);
+    render(&mut app, &content, 40, 10);
+    assert_eq!(app.focus, None);
+    key(&mut app, KeyCode::Enter);
+    render(&mut app, &content, 40, 10);
+    assert_eq!(app.sheet, None);
+    let bottom = app.scroll;
+    key(&mut app, KeyCode::Char('k'));
+    render(&mut app, &content, 40, 10);
+    assert_eq!(app.focus, Some(content.projects.len() - 1));
+    assert_eq!(app.scroll, bottom);
+}
+
+#[test]
 fn end_scrolls_to_the_bottom_on_every_page() {
     let content = content();
     for page in ['h', 'w', 'p', 't'] {

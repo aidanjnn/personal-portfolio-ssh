@@ -1092,8 +1092,10 @@ fn settle<'a>(
     }
     app.scroll = app.scroll.min(app.max_scroll);
     let scroll = app.scroll;
-    // In the Reader, a link scrolled fully out of view is no longer focused.
-    if let (Page::Reader(_), Some(index), false) = (app.page, app.focus, revealed) {
+    // On every page, an item scrolled fully out of view (End, PgDn, a resize) is no longer
+    // focused, so the status bar, Enter, `o` and `c` never act on something off screen.
+    // Tab or j then picks up from what is on screen.
+    if let (Some(index), false) = (app.focus, revealed) {
         let item = doc.items[index];
         if item.bottom < scroll || item.top >= scroll + view {
             app.focus = None;
