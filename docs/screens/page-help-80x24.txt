@@ -1,0 +1,24 @@
+
+       Aidan Jeon    996    Projects    Thoughts
+
+       Updated Nov 9th, 2026
+              ┌─ keys ───────────────────────────────────────────┐
+       I'm a S│                                                  │erloo,
+       focused│  h w p t  pages          ← →  prev / next        │AI.
+              │  j k ↑ ↓  move           ↵  open · expand        │
+       Most re│  esc      back           o c  show · copy link   │the
+       mortgag│  d        theme: paper / night / plain           │
+       people!│  q        quit                                   │
+              │                                                  │
+       Previou│  ──────────────────────────────────────────────  │ at
+       Vancouv│  SSH idea from Sean Yang · seanyang.ca           │eek to
+       achieve│  built with ratatui + russh · source             │
+              │                                                  │
+       I split│  © Aidan Jeon 2026             ← ◇ se-webring →  │of
+       work, I│                                                  │.
+              │                                                  │
+       Open to└──────────────────────────────────────────────────┘,
+
+       © Aidan Jeon 2026                                            ← ◇ →
+
+       esc close                                                   q quit

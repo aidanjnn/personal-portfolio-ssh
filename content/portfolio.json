@@ -1,0 +1,340 @@
+{
+  "version": 2,
+  "updated": "Updated Nov 9th, 2026",
+  "name": "Aidan Jeon",
+  "web": "https://www.aidanjeon.com",
+  "intro": [
+    [
+      {
+        "text": "I'm a ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "Software Engineering",
+        "style": "plain",
+        "url": "https://uwaterloo.ca/engineering/"
+      },
+      {
+        "text": " student at the ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "University of Waterloo",
+        "style": "emphasis",
+        "url": null
+      },
+      {
+        "text": ", focused on agent infrastructure and dabbling into physical AI.",
+        "style": "plain",
+        "url": null
+      }
+    ],
+    [
+      {
+        "text": "Most recently built agents for regulated finance, changing the mortgage industry with ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "Copperlane (YC W26)",
+        "style": "accent",
+        "url": "https://www.copperlane.ai/"
+      },
+      {
+        "text": " in SF with great people!",
+        "style": "plain",
+        "url": null
+      }
+    ],
+    [
+      {
+        "text": "Previously, I was the youngest ever engineering intern (15) at Vancouver's largest hospital. In this stage of my life, I ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "seek to achieve greatness",
+        "style": "highlight",
+        "url": null
+      },
+      {
+        "text": " in every single thing I touch!",
+        "style": "plain",
+        "url": null
+      }
+    ],
+    [
+      {
+        "text": "I split my time across SF, Toronto, and Vancouver. Outside of work, I like long walks, football, and finding sunset views.",
+        "style": "plain",
+        "url": null
+      }
+    ],
+    [
+      {
+        "text": "Open to internships + full-time roles. You can find me on ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "X",
+        "style": "plain",
+        "url": "https://x.com/aidanjnn"
+      },
+      {
+        "text": ", ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "LinkedIn",
+        "style": "plain",
+        "url": "https://linkedin.com/in/aidanjeon"
+      },
+      {
+        "text": ", ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "GitHub",
+        "style": "plain",
+        "url": "https://github.com/aidanjnn"
+      },
+      {
+        "text": ", or reach me via ",
+        "style": "plain",
+        "url": null
+      },
+      {
+        "text": "email",
+        "style": "plain",
+        "url": "mailto:aidanjeon00@gmail.com"
+      },
+      {
+        "text": ".",
+        "style": "plain",
+        "url": null
+      }
+    ]
+  ],
+  "work": [
+    {
+      "year": 2026,
+      "company": "Copperlane (YC W26)",
+      "role": "Software Engineering Intern",
+      "description": "Copperlane is the intelligence layer for regulated finance. Helped develop the agent + eval harness + did FDE work in SF (summer 2026).",
+      "url": "https://www.copperlane.ai/"
+    },
+    {
+      "year": 2026,
+      "company": "UW Blueprint",
+      "role": "Software Engineer",
+      "description": "Home Again Furniture Bank: Building software for furniture distribution.",
+      "url": "https://uwblueprint.org"
+    },
+    {
+      "year": 2025,
+      "company": "WATonomous",
+      "role": "Robotics",
+      "description": "Autonomous driving. Super interested in world models.",
+      "url": "https://www.watonomous.ca/"
+    },
+    {
+      "year": 2024,
+      "company": "Vancouver General Hospital",
+      "role": "Biomedical Engineering Intern",
+      "description": "Youngest Biomedical Engineering intern @ BC's largest hospital (15), worked on medical device hardware.",
+      "url": "https://www.providencehealthcare.org/en/health-care-professionals/tools-resources/lower-mainland-biomedical-engineering"
+    },
+    {
+      "year": 2024,
+      "company": "Strive",
+      "role": "Organizer",
+      "description": "Partnered with Western University to deliver Canada's largest tech-business comp hosting [AI start-ups, Microsoft/EA PMs, EY product design, etc.]",
+      "url": "https://strivecompetition.org"
+    }
+  ],
+  "projects": [
+    {
+      "slug": "teachar",
+      "title": "teachAR",
+      "event": "Hack the North",
+      "summary": "AR tutor for learning physical skills through recorded ghost hands & an AI coach",
+      "year": 2026,
+      "url": "https://github.com/aidanjnn/teachAR"
+    },
+    {
+      "slug": "otto",
+      "title": "Otto",
+      "event": null,
+      "summary": "Voice agent automating GitHub, Gmail, & G-Cal via natural speech. Won 1st place at NexHacks at CMU (1500+ hackers) (Best use of LiveKit — $1000 + internship).",
+      "year": 2026,
+      "url": "https://github.com/abrj7/otto"
+    },
+    {
+      "slug": "toothfairy",
+      "title": "Toothfairy",
+      "event": null,
+      "summary": "Cursor for dentists, streamlining dental workflows",
+      "year": 2026,
+      "url": "https://github.com/7kzaincode/toothfairy"
+    },
+    {
+      "slug": "sketchy",
+      "title": "Sketchy",
+      "event": null,
+      "summary": "Draw wireframes & deploy to Vercel in <60 seconds",
+      "year": 2026,
+      "url": "https://github.com/aidanjnn/sketchy"
+    }
+  ],
+  "thoughts": [
+    {
+      "slug": "misc",
+      "title": "misc.",
+      "subtitle": "my entire life-stack",
+      "year": 2026,
+      "url": "https://www.aidanjeon.com/thoughts/misc",
+      "sections": [
+        {
+          "heading": "productivity stack",
+          "items": [
+            {
+              "text": "dia (considering aside)",
+              "url": null
+            },
+            {
+              "text": "wisprflow (my coworkers put me on)",
+              "url": null
+            },
+            {
+              "text": "notion (ever since grade 8)",
+              "url": null
+            },
+            {
+              "text": "poke (negotiated it down to 0.50 c/m)",
+              "url": null
+            },
+            {
+              "text": "paper",
+              "url": null
+            },
+            {
+              "text": "cap (open-source screen studio)",
+              "url": null
+            },
+            {
+              "text": "raycast",
+              "url": null
+            },
+            {
+              "text": "rectangle",
+              "url": null
+            }
+          ]
+        },
+        {
+          "heading": "devtools",
+          "items": [
+            {
+              "text": "cloud-based agents: devin",
+              "url": null
+            },
+            {
+              "text": "zed, cursor (for design)",
+              "url": null
+            },
+            {
+              "text": "codex macOS app (lovely harness + considering the move to GUI)",
+              "url": null
+            },
+            {
+              "text": "ghostty (best native macOS terminal emulator) + tmux",
+              "url": null
+            },
+            {
+              "text": "graphify (turns codebase into a knowledge-graph for faster queries)",
+              "url": null
+            }
+          ]
+        },
+        {
+          "heading": "exercise",
+          "items": [
+            {
+              "text": "arnold split at fitness sf",
+              "url": null
+            },
+            {
+              "text": "cardio done through playing soccer/hooping/hiking",
+              "url": null
+            }
+          ]
+        },
+        {
+          "heading": "fashion",
+          "items": [
+            {
+              "text": "gap denim on my own collection",
+              "url": null
+            },
+            {
+              "text": "k-two studios",
+              "url": null
+            },
+            {
+              "text": "japanese jewelry",
+              "url": null
+            },
+            {
+              "text": "prime intellect hoodie [ thanks to the prime intellect team for sending me one :) ]",
+              "url": null
+            }
+          ]
+        },
+        {
+          "heading": "finances",
+          "items": [
+            {
+              "text": "wealthsimple for everything (0 fx fees!)",
+              "url": null
+            },
+            {
+              "text": "wise (recommend for canadians interning in the US)",
+              "url": null
+            }
+          ]
+        },
+        {
+          "heading": "music",
+          "items": [
+            {
+              "text": "dpr live/dabin.kr (jasmine, martini blue, etc.)",
+              "url": null
+            },
+            {
+              "text": "brockhampton (summer, bleach, team, etc.)",
+              "url": null
+            },
+            {
+              "text": "steve lacy, justin bieber, jenevieve, olivia dean, yiruma (classical)",
+              "url": null
+            },
+            {
+              "text": "drop a follow @",
+              "url": "https://open.spotify.com/user/31de43lgixkkikvs72ou7bbci5eu?si=fa3a5e15cb9d46f0"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "webring": {
+    "previous": "https://dwseoh.com",
+    "home": "https://se-webring.xyz/",
+    "next": "https://www.simranthind.me/"
+  }
+}

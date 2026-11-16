@@ -1,0 +1,24 @@
+
+       Aidan Jeon    996    Projects    Thoughts
+
+       Work
+
+     › 2026  Copperlane (YC W26) ▴         Software Engineering Intern
+             Copperlane is the intelligence layer for regulated
+             finance. Helped develop the agent + eval harness + did FDE
+             work in SF (summer 2026).
+
+       2026  UW Blueprint ▾                Software Engineer
+
+       2025  WATonomous ▾                  Robotics
+
+       2024  Vancouver General Hospital ▾  Biomedical Engineering Intern
+
+       2024  Strive ▾                      Organizer
+
+
+
+
+       © Aidan Jeon 2026                                            ← ◇ →
+
+       ↗ copperlane.ai   ↵ collapse   o link            ? keys  ·  q quit
