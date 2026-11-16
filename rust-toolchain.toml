@@ -1,5 +1,6 @@
 # Clippy adds lints in new releases, so local runs and CI only agree when they
-# use the same toolchain. rustup installs this one on first use.
+# use the same toolchain. rustup installs this one on first use. Bump it together
+# with RUST_IMAGE in the Dockerfile.
 [toolchain]
 channel = "1.100.0"
 components = ["clippy", "rustfmt"]

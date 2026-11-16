@@ -1,0 +1,380 @@
+name: Deploy
+
+# For a release tag: runs ci.yml, builds the linux/amd64 image and pushes it to
+# GHCR (or, if the tag's image already exists, reuses it without testing or
+# building), then, when the DEPLOY_ENABLED repository variable is 'true',
+# rolls its digest out to the Azure VM over Tailscale SSH, rolling back if it
+# doesn't become healthy. Only then does :latest move to it, so :latest is
+# always the last healthy release. Runbook: docs/DEPLOYMENT.md.
+# It never syncs deploy/: re-run deploy/azure.sh after changing those files.
+#
+# Runs only for v* tags: on a tag push, or from "Run workflow" with a v* tag
+# picked under "Use workflow from". Any other ref fails the first job. The
+# production environment is limited to v* tags as well, and a tag ruleset
+# protects them (docs/DEPLOYMENT.md, "GitHub settings").
+#
+# Repository variables: DEPLOY_ENABLED, DEPLOY_HOST (tailnet hostname),
+#   DEPLOY_USER (default deploy), PUBLIC_HOST (default ssh.aidanjeon.com),
+#   HOST_KEY_FINGERPRINT (optional, SHA256:...)
+# production environment secrets: TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET
+#
+# Every action is pinned to a full commit SHA; the comment names its release.
+# To bump one, look up the new tag's commit (for an annotated tag, take the
+# line ending in ^{}):
+#   git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>*'
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Pick an existing v* tag under "Use workflow from". Moves :latest to it once
+  # it is healthy, so this is also the rollback.
+  workflow_dispatch:
+
+permissions: {}
+
+# One rollout at a time; never cancel one halfway.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/aidanjnn/personal-portfolio-ssh
+
+jobs:
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      packages: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      exists: ${{ steps.existing.outputs.exists }}
+      digest: ${{ steps.existing.outputs.digest }}
+    steps:
+      - name: Refuse anything but a v* tag
+        id: tag
+        run: |
+          # workflow_dispatch can start from any branch; only release tags deploy.
+          if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::Run this workflow from a v* tag (Use workflow from → Tags), not $GITHUB_REF"
+            exit 1
+          fi
+          # The tag ends up in an image reference and a remote shell command.
+          TAG=$GITHUB_REF_NAME
+          if [[ ! "$TAG" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            echo "::error::Tag '$TAG' must start with v and contain only [0-9A-Za-z._-]"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A tag that already has an image (a rollback or a redeploy) is never
+      # rebuilt: a rebuild would produce different bytes under the same tag.
+      - name: Look for an existing image
+        id: existing
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The package that holds every tag, as OWNER/NAME (user-owned).
+          package=${IMAGE#ghcr.io/}
+          if out=$(docker buildx imagetools inspect "$REF" 2>&1); then
+            digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$out")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not read the digest of $REF"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            echo "$REF exists as $digest: reusing it, no build"
+            { echo "exists=true"; echo "digest=$digest"; } >> "$GITHUB_OUTPUT"
+          elif grep -Eqi 'not found|manifest unknown|name unknown' <<<"$out"; then
+            echo "$REF does not exist yet: testing and building it"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          elif grep -Eqi 'denied|unauthorized' <<<"$out"; then
+            # GHCR answers DENIED, not "not found", while the package has no
+            # image at all (the first release). The packages API tells the two
+            # apart: 404 means there is no package yet, so nothing to reuse.
+            # GitHub documents that API for classic tokens only, so GITHUB_TOKEN
+            # may get 403 instead. Treating 403 as "no package" is safe: if a
+            # package existed that this repo cannot read, the push in the image
+            # job would be denied too, so an existing tag is never overwritten.
+            if api=$(gh api "users/${package%%/*}/packages/container/${package#*/}" --jq .name 2>&1); then
+              echo "::error::Package $package exists, but reading $REF was denied"
+              printf '%s\n' "$out"
+              exit 1
+            elif grep -Eq 'HTTP 40[34]' <<<"$api"; then
+              echo "No readable package $package yet: testing and building $REF"
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Could not check $REF, or whether package $package exists"
+              printf '%s\n' "$out" "$api"
+              exit 1
+            fi
+          else
+            # Anything else (auth, network) must not fall through to a rebuild.
+            echo "::error::Could not check $REF"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+  # fmt, clippy, cargo test and the SSH smoke suite (ci.yml, at this tag) must
+  # pass before an image is pushed. Skipped when the image already exists.
+  test:
+    name: Test
+    needs: resolve
+    if: needs.resolve.outputs.exists == 'false'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  image:
+    name: Build or reuse image
+    needs: [resolve, test]
+    # Runs after a passing test job, or with no test job when the image exists.
+    if: >-
+      !cancelled() && needs.resolve.result == 'success' &&
+      (needs.test.result == 'success' ||
+       (needs.test.result == 'skipped' && needs.resolve.outputs.exists == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.resolve.outputs.exists == 'false'
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        if: needs.resolve.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # Only the release tag: :latest moves in the promote job, once the
+          # release is healthy.
+          tags: ${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The VM pulls by digest, never by the mutable tag.
+      - name: Image digest
+        id: digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest || needs.resolve.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No image digest (got '$DIGEST')"
+            exit 1
+          fi
+          echo "$IMAGE@$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to VM
+    needs: [resolve, image]
+    if: >-
+      !cancelled() && needs.image.result == 'success' &&
+      vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    # Limited to v* tags in the repository settings. TS_OAUTH_* below are this
+    # environment's secrets, so no other job or ref can read them.
+    environment:
+      name: production
+      url: https://aidanjeon.com
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      DIGEST: ${{ needs.image.outputs.digest }}
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+      PUBLIC_HOST: ${{ vars.PUBLIC_HOST || 'ssh.aidanjeon.com' }}
+      EXPECTED_FINGERPRINT: ${{ vars.HOST_KEY_FINGERPRINT }}
+    steps:
+      - name: Join tailnet
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Roll out, roll back if unhealthy
+        run: |
+          if [[ -z "$DEPLOY_HOST" ]]; then
+            echo "::error::Repository variable DEPLOY_HOST is not set"
+            exit 1
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No image digest from the image job"
+            exit 1
+          fi
+          IMAGE_REF="$IMAGE@$DIGEST"
+          echo "Deploying $TAG as $IMAGE_REF"
+          # Tailscale SSH: tailscaled on the VM answers port 22 on its tailnet
+          # address (OpenSSH is masked there). The tailnet authenticates both
+          # ends, so there is no client key, and accept-new only records the
+          # node's host key. If Tailscale SSH were off, this would reach the
+          # portfolio instead, which rejects exec, so the step fails safely.
+          #
+          # The rollout touches only the portfolio service: Caddy keeps running
+          # whatever happens.
+          #
+          # It runs detached from this SSH session, so a connection that drops
+          # halfway (a lost runner, a tailnet blip) cannot kill it between
+          # stopping the old container and the health check: it still ends
+          # healthy or rolled back. Over the session, a short launcher saves the
+          # rollout to a file and starts it with setsid, in its own session and
+          # process group, with SIGHUP and SIGPIPE ignored and its output going
+          # to a log file rather than to this connection. The launcher streams
+          # that log back and exits with the rollout's status, so the step still
+          # shows every line and fails when the rollout does. If the session
+          # drops, the step fails but the rollout carries on; re-running the job
+          # waits on its lock, then redeploys the same digest.
+          #
+          # Not systemd-run: `deploy` is not root, so it cannot start system
+          # units; a --user unit stops with the user's last session unless
+          # lingering is enabled; and --pipe would tie the unit's input and
+          # output to this very connection.
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s -- "$IMAGE_REF" <<'REMOTE'
+          set -euo pipefail
+          # Logs of earlier rollouts are kept for a month, for post-mortems.
+          find "$HOME" -maxdepth 1 -type d -name 'rollout-*' -mtime +30 -exec rm -rf {} + || true
+          run=$(mktemp -d "$HOME/rollout-XXXXXX")
+          cat > "$run/rollout.sh" <<'ROLLOUT'
+          set -euo pipefail
+          trap '' HUP PIPE
+          # One rollout at a time, including one a dropped session left running.
+          exec 9>"$HOME/.rollout.lock"
+          if ! flock -w 600 9; then
+            echo "::error::An earlier rollout still holds $HOME/.rollout.lock"
+            exit 1
+          fi
+          new=$1
+          repo=${new%@*}
+          cd /opt/portfolio
+          compose() { docker compose -f compose.prod.yaml "$@"; }
+
+          # Record what runs now, by digest if the image has one, so a rollback
+          # restores exactly that image even if its tag has moved since.
+          prev=""
+          id=$(compose ps -a -q portfolio)
+          if [[ -n "$id" ]]; then
+            image_id=$(docker inspect -f '{{.Image}}' "$id")
+            prev=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$image_id" \
+              | grep -m 1 "^$repo@sha256:" || true)
+            [[ -n "$prev" ]] || prev=$(docker inspect -f '{{.Config.Image}}' "$id")
+          fi
+          echo "current: ${prev:-none}"
+
+          export PORTFOLIO_IMAGE=$new
+          if ! compose pull --quiet portfolio; then
+            echo "::error::Could not pull $new; nothing was changed"
+            exit 1
+          fi
+          if compose up -d --wait --wait-timeout 120 portfolio; then
+            echo "healthy: $new"
+            exit 0
+          fi
+
+          echo "::error::$new did not become healthy within 120 s"
+          compose logs --no-color --tail 40 portfolio || true
+          if [[ -z "$prev" ]]; then
+            echo "::error::No previous release to roll back to"
+            exit 1
+          fi
+          echo "Rolling back to $prev"
+          export PORTFOLIO_IMAGE=$prev
+          if compose up -d --wait --wait-timeout 120 portfolio; then
+            echo "::error::Rolled back to $prev, which is healthy. The release failed."
+          else
+            echo "::error::The rollback to $prev is not healthy either. Check the VM."
+          fi
+          exit 1
+          ROLLOUT
+          : > "$run/log"
+          setsid --wait bash "$run/rollout.sh" "$1" > "$run/log" 2>&1 < /dev/null &
+          rollout=$!
+          tail -n +1 -f --pid="$rollout" "$run/log"
+          wait "$rollout"
+          REMOTE
+
+      - name: Smoke test public SSH
+        run: |
+          # Both ports must serve the portfolio's key: 22 is the advertised path and
+          # 2222 the fallback for networks that block outbound 22. Either failing fails the job.
+          for port in 2222 22; do
+            key=""
+            for _ in $(seq 1 10); do
+              key=$(ssh-keyscan -T 5 -t ed25519 -p "$port" "$PUBLIC_HOST" 2>/dev/null | grep ' ssh-ed25519 ' || true)
+              [[ -n "$key" ]] && break
+              sleep 3
+            done
+            if [[ -z "$key" ]]; then
+              echo "::error::No ed25519 host key from $PUBLIC_HOST:$port. The rollout was healthy, so the VM now serves this release while :latest stays on the previous one. Check DNS and the NSG, then re-run this workflow or roll back."
+              exit 1
+            fi
+            fp=$(ssh-keygen -lf - <<<"$key" | awk '{print $2}')
+            echo "$PUBLIC_HOST:$port serves ed25519 $fp"
+            if [[ -n "$EXPECTED_FINGERPRINT" && "$fp" != "$EXPECTED_FINGERPRINT" ]]; then
+              echo "::error::Host key changed on port $port: expected $EXPECTED_FINGERPRINT, got $fp. The VM serves this release; :latest stays on the previous one."
+              exit 1
+            fi
+          done
+
+  # :latest is the last healthy release. It moves only after the rollout passed
+  # its health gate, or, with deploys off, once the image is built or found.
+  # A failed or rolled-back deploy leaves it where it was. If only the public
+  # smoke test fails, the VM keeps the new, healthy release and :latest lags it.
+  promote:
+    name: Move :latest
+    needs: [resolve, image, deploy]
+    if: ${{ !cancelled() && needs.image.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point :latest at the release
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No image digest from the image job"
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+          echo ":latest is now $TAG ($IMAGE@$DIGEST)"

@@ -1,0 +1,92 @@
+name: Uptime
+
+# Checks the public endpoints every 30 minutes with no outside service. On
+# failure it opens an issue (or comments on the open one), which GitHub emails
+# to the owner; when the checks pass again it closes the issue.
+# Does nothing until the DEPLOY_ENABLED repository variable is 'true'.
+# Runbook: docs/DEPLOYMENT.md, "Monitoring".
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check aidanjeon.com
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      HOST: aidanjeon.com
+      TITLE: "Uptime: aidanjeon.com is failing its checks"
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Probe SSH and HTTPS
+        id: probe
+        run: |
+          probe() {
+            local failures=() headers status location
+            # The portfolio's SSH server on port 22 must complete a key exchange.
+            if ! ssh-keyscan -T 10 -p 22 "$HOST" 2>/dev/null | grep -q ' ssh-'; then
+              failures+=("ssh: no host key from $HOST:22 within 10 s")
+            fi
+            # Caddy must redirect the apex to www with a 308.
+            headers=$(curl -sSI --max-time 15 "https://$HOST" 2>&1 | tr -d '\r') || true
+            # The last status line: a proxy may answer CONNECT with its own first.
+            status=$(awk '/^HTTP\// {s = $2} END {print s}' <<<"$headers")
+            location=$(awk 'tolower($1) == "location:" {print $2}' <<<"$headers")
+            if [[ "$status" != 308 || "$location" != https://www.aidanjeon.com/* ]]; then
+              failures+=("https: expected 308 to https://www.aidanjeon.com/, got '${status:-no response}' '${location}'")
+            fi
+            (( ${#failures[@]} == 0 )) && return 0
+            printf -- '- %s\n' "${failures[@]}"
+            return 1
+          }
+          # Three tries a minute apart, so one dropped packet doesn't page anyone.
+          for attempt in 1 2 3; do
+            if report=$(probe); then
+              echo "All checks passed (attempt $attempt)"
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Attempt $attempt failed:"
+            echo "$report"
+            [[ $attempt == 3 ]] || sleep 60
+          done
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          { echo "report<<EOF"; echo "$report"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the outage issue
+        if: steps.probe.outputs.ok == 'false'
+        env:
+          REPORT: ${{ steps.probe.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          number=$(gh issue list --state open --limit 100 \
+            --json number,title --jq "map(select(.title == env.TITLE)) | .[0].number // empty")
+          body=$(printf '%s\n\nChecked %s. [Run](%s)\n' "$REPORT" "$(date -u '+%Y-%m-%d %H:%M UTC')" "$RUN_URL")
+          if [[ -n "$number" ]]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$(printf '%s\n\n@%s the public endpoints are down. Runbook: docs/DEPLOYMENT.md, "Monitoring" and "Break-glass". This issue closes itself when the checks pass again.\n' "$body" "$GITHUB_REPOSITORY_OWNER")"
+          fi
+          exit 1
+
+      - name: Close the outage issue
+        if: steps.probe.outputs.ok == 'true'
+        run: |
+          number=$(gh issue list --state open --limit 100 \
+            --json number,title --jq "map(select(.title == env.TITLE)) | .[0].number // empty")
+          if [[ -n "$number" ]]; then
+            gh issue close "$number" --comment "Recovered: all checks pass as of $(date -u '+%Y-%m-%d %H:%M UTC')."
+          fi

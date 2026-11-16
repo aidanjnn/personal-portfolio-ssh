@@ -1,0 +1,120 @@
+# Production stack for the Azure VM. Lives at /opt/portfolio/compose.prod.yaml.
+# deploy/bootstrap.sh installs it and starts it.
+#
+#   cd /opt/portfolio
+#   TAG=v0.1.0 docker compose -f compose.prod.yaml pull portfolio
+#   TAG=v0.1.0 docker compose -f compose.prod.yaml up -d --wait portfolio
+#
+# PORTFOLIO_IMAGE (a full reference, e.g. ...@sha256:...) wins over TAG.
+# With neither, compose falls back to :latest.
+# NEVER run `docker compose down -v`: it deletes the SSH host key volume.
+
+# A fixed project name keeps volume names stable (portfolio_host-key, ...)
+# no matter which directory the file is run from.
+name: portfolio
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "1m"
+      max-file: "3"
+
+services:
+  portfolio:
+    <<: *hardening
+    # PORTFOLIO_IMAGE is a full reference; CI and bootstrap pass a digest
+    # (ghcr.io/...@sha256:...). By hand, TAG=<tag> is enough.
+    image: ${PORTFOLIO_IMAGE:-ghcr.io/aidanjnn/personal-portfolio-ssh:${TAG:-latest}}
+    # The Dockerfile's USER, stated here too so no image can run as root.
+    user: "10001:10001"
+    command:
+      - serve
+      - --bind
+      - 0.0.0.0:2222
+      - --host-key
+      - /data/ssh_host_ed25519_key
+      # 32 sessions of a few MiB each fit the 256 MiB cap below on a 1 GiB VM.
+      - --max-sessions
+      - "32"
+      - --max-per-ip
+      - "3"
+      - --idle-timeout
+      - "300"
+      - --max-session-secs
+      - "1800"
+      - --content-url
+      - https://www.aidanjeon.com/portfolio.json
+    ports:
+      # Host :22 only binds once OpenSSH no longer listens on it;
+      # deploy/bootstrap.sh masks OpenSSH before it starts the stack.
+      - "22:2222"
+      # Fallback for networks that block outbound 22.
+      - "2222:2222"
+    volumes:
+      # Holds the persistent server identity. Generated once, backed up
+      # offline, never regenerated.
+      - host-key:/data
+    networks:
+      - ssh
+    # Same check as the Dockerfile's HEALTHCHECK, stated here so the rollout
+    # gate (up --wait) never depends on image metadata. It is a real SSH key
+    # exchange against the container's own port, using only what the runtime
+    # image has: sh, grep and ssh-keyscan from openssh-client. start_interval
+    # lets --wait see "healthy" seconds after start instead of after 30 s.
+    healthcheck:
+      test: ["CMD-SHELL", "ssh-keyscan -T 3 -p 2222 -t ed25519 127.0.0.1 2>/dev/null | grep -q ssh-ed25519"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    stop_grace_period: 10s
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 64
+
+  caddy:
+    <<: *hardening
+    # Exact version plus index digest: a re-pull can't change what runs. To
+    # bump, pick a release from hub.docker.com/_/caddy and look up its digest:
+    #   docker buildx imagetools inspect caddy:<version>   # "Digest: sha256:..."
+    # Then re-run deploy/azure.sh (CI never touches this file on the VM).
+    image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
+    # The image's caddy binary carries the cap_net_bind_service file
+    # capability. With cap_drop: ALL it cannot exec unless the capability
+    # stays in the bounding set.
+    cap_add:
+      - NET_BIND_SERVICE
+    # TCP only: the NSG admits no UDP, and the Caddyfile turns HTTP/3 off.
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # certificates and ACME account: keep it
+      - caddy-config:/config
+    tmpfs:
+      - /tmp
+    networks:
+      - web
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 64
+
+# The two services never talk to each other, so they get separate networks.
+networks:
+  ssh:
+  web:
+
+volumes:
+  host-key:
+  caddy-data:
+  caddy-config:
