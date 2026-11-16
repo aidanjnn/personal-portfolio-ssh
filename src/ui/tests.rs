@@ -561,6 +561,63 @@ fn the_end_of_a_reader_longer_than_u16_rows_is_reachable() {
     assert!(item.top > usize::from(u16::MAX));
 }
 
+/// The bundled content with thought 0 holding one link between `plain` unlinked items on each
+/// side.
+fn reader_with_one_link_in_the_middle(plain: usize) -> Portfolio {
+    use crate::content::{ThoughtItem, ThoughtSection};
+    edited(|data| {
+        let item = |index: usize, url: Option<String>| ThoughtItem {
+            text: format!("Item {index}"),
+            url,
+        };
+        let mut items: Vec<ThoughtItem> = (0..plain).map(|index| item(index, None)).collect();
+        items.push(item(plain, Some("https://example.com/".into())));
+        items.extend((plain + 1..=2 * plain).map(|index| item(index, None)));
+        data.thoughts[0].sections = vec![ThoughtSection {
+            heading: "Links".into(),
+            items,
+        }];
+    })
+}
+
+#[test]
+fn tab_and_shift_tab_from_nothing_focused_do_not_wrap() {
+    let content = reader_with_one_link_in_the_middle(30);
+    let mut app = App::default();
+    for code in [KeyCode::Char('t'), KeyCode::Enter] {
+        render(&mut app, &content, 40, 12);
+        key(&mut app, code);
+    }
+    render(&mut app, &content, 40, 12);
+    assert_eq!(
+        (app.page, app.focus, app.scroll),
+        (Page::Reader(0), None, 0)
+    );
+    // The only link is below the view: Shift-Tab has nothing above, so nothing happens.
+    key(&mut app, KeyCode::BackTab);
+    render(&mut app, &content, 40, 12);
+    assert_eq!((app.focus, app.scroll), (None, 0));
+    // At the bottom the link is above the view: Tab has nothing below.
+    key(&mut app, KeyCode::End);
+    render(&mut app, &content, 40, 12);
+    let bottom = app.max_scroll;
+    assert_eq!((app.focus, app.scroll), (None, bottom));
+    key(&mut app, KeyCode::Tab);
+    render(&mut app, &content, 40, 12);
+    assert_eq!((app.focus, app.scroll), (None, bottom));
+    // Each key does reach the link in its own direction.
+    key(&mut app, KeyCode::BackTab);
+    render(&mut app, &content, 40, 12);
+    assert_eq!(app.focus, Some(0));
+    let link = app.items[0];
+    assert!(link.top >= app.scroll && link.bottom < app.scroll + app.viewport);
+    key(&mut app, KeyCode::Char('g'));
+    render(&mut app, &content, 40, 12);
+    key(&mut app, KeyCode::Tab);
+    render(&mut app, &content, 40, 12);
+    assert_eq!(app.focus, Some(0));
+}
+
 #[test]
 fn leaving_a_page_resets_focus_and_scroll() {
     let content = content();

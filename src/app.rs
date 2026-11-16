@@ -230,24 +230,16 @@ impl App {
         let next = match self.focus {
             Some(index) if forward => (index + 1 < count).then_some(index + 1),
             Some(index) => index.checked_sub(1),
-            // Nothing focused (the Reader): start from what is on screen.
+            // Nothing focused: start from what is on screen, the first item from the top of the
+            // view down or the last from its bottom up. As with a focused item at either end,
+            // there is no wrap-around when nothing lies that way.
             None => {
                 let top = self.scroll;
                 let bottom = self.scroll.saturating_add(self.viewport);
                 if forward {
-                    Some(
-                        self.items
-                            .iter()
-                            .position(|item| item.top >= top)
-                            .unwrap_or(0),
-                    )
+                    self.items.iter().position(|item| item.top >= top)
                 } else {
-                    Some(
-                        self.items
-                            .iter()
-                            .rposition(|item| item.bottom < bottom)
-                            .unwrap_or(count - 1),
-                    )
+                    self.items.iter().rposition(|item| item.bottom < bottom)
                 }
             }
         };
