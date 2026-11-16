@@ -7,12 +7,17 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to commit SHAs; see deploy.yml for how to bump them.
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      # rustup installs the toolchain and components pinned in rust-toolchain.toml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustup ships on GitHub's runners, so no third-party action is needed. It installs
+      # the toolchain and components pinned in rust-toolchain.toml.
       - name: Install the pinned Rust toolchain
         run: |
           rustup toolchain install

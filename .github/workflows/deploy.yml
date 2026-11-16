@@ -9,6 +9,11 @@ name: Deploy
 #   DEPLOY_USER (default deploy), PUBLIC_HOST (default ssh.aidanjeon.com),
 #   HOST_KEY_FINGERPRINT (optional, SHA256:...)
 # Secrets: TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET
+#
+# Every action is pinned to a full commit SHA; the comment names its release.
+# To bump one, look up the new tag's commit (for an annotated tag, take the
+# line ending in ^{}):
+#   git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>*'
 
 on:
   push:
@@ -53,20 +58,20 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64
@@ -97,7 +102,7 @@ jobs:
       EXPECTED_FINGERPRINT: ${{ vars.HOST_KEY_FINGERPRINT }}
     steps:
       - name: Join tailnet
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
