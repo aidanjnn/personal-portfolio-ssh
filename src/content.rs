@@ -8,6 +8,10 @@ pub const CONTENT_VERSION: u8 = 2;
 const SHORT_TEXT_LIMIT: usize = 128;
 const BODY_TEXT_LIMIT: usize = 2048;
 const URL_LIMIT: usize = 2048;
+/// The most entries any list may hold: work, projects, thoughts, and a section's items.
+/// Expanded Work rows live in a `u64` bitset (`App::expanded`), so this cannot exceed 64.
+pub const MAX_LIST_ENTRIES: usize = 64;
+const _: () = assert!(MAX_LIST_ENTRIES <= u64::BITS as usize);
 
 /// Public portfolio content, contract v2. The website serves it at /portfolio.json.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -156,7 +160,7 @@ impl Portfolio {
                 return Err(ContentError(format!("{field} has no visible text")));
             }
         }
-        validate_count("work", self.work.len(), 64)?;
+        validate_count("work", self.work.len(), MAX_LIST_ENTRIES)?;
         for (index, work) in self.work.iter().enumerate() {
             let field = format!("work[{index}]");
             validate_entry(&field, &work.company, work.year, &work.url)?;
@@ -167,7 +171,7 @@ impl Portfolio {
                 BODY_TEXT_LIMIT,
             )?;
         }
-        validate_count("projects", self.projects.len(), 64)?;
+        validate_count("projects", self.projects.len(), MAX_LIST_ENTRIES)?;
         for (index, project) in self.projects.iter().enumerate() {
             let field = format!("projects[{index}]");
             validate_slug(&format!("{field}.slug"), &project.slug)?;
@@ -181,7 +185,7 @@ impl Portfolio {
                 BODY_TEXT_LIMIT,
             )?;
         }
-        validate_count("thoughts", self.thoughts.len(), 64)?;
+        validate_count("thoughts", self.thoughts.len(), MAX_LIST_ENTRIES)?;
         for (index, thought) in self.thoughts.iter().enumerate() {
             let field = format!("thoughts[{index}]");
             validate_slug(&format!("{field}.slug"), &thought.slug)?;
@@ -203,7 +207,11 @@ impl Portfolio {
                     &section.heading,
                     SHORT_TEXT_LIMIT,
                 )?;
-                validate_count(&format!("{field}.items"), section.items.len(), 64)?;
+                validate_count(
+                    &format!("{field}.items"),
+                    section.items.len(),
+                    MAX_LIST_ENTRIES,
+                )?;
                 for (item_index, item) in section.items.iter().enumerate() {
                     let field = format!("{field}.items[{item_index}]");
                     validate_text(&format!("{field}.text"), &item.text, BODY_TEXT_LIMIT)?;
@@ -460,6 +468,15 @@ mod tests {
         assert_eq!(schema["$defs"]["bodyText"]["maxLength"], BODY_TEXT_LIMIT);
         assert_eq!(schema["$defs"]["url"]["maxLength"], URL_LIMIT);
         assert_eq!(schema["properties"]["version"]["const"], CONTENT_VERSION);
+        let properties = &schema["properties"];
+        for list in ["work", "projects", "thoughts"] {
+            assert_eq!(properties[list]["maxItems"], MAX_LIST_ENTRIES, "{list}");
+        }
+        let sections = &properties["thoughts"]["items"]["properties"]["sections"];
+        assert_eq!(
+            sections["items"]["properties"]["items"]["maxItems"],
+            MAX_LIST_ENTRIES
+        );
         let snapshot: serde_json::Value = serde_json::from_str(BUNDLED_JSON).unwrap();
         let required: Vec<&str> = schema["required"]
             .as_array()

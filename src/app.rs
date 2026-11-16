@@ -1,6 +1,7 @@
 //! Page state and key handling. Holds indices only; `ui::draw` resolves them against content.
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::content::MAX_LIST_ENTRIES;
 pub use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,7 +61,7 @@ pub struct App {
     pub max_scroll: u16,
     pub page: Page,
     pub focus: Option<usize>,
-    /// Expanded Work rows (content allows at most 64).
+    /// Expanded Work rows, one bit per row; read it with `is_expanded`.
     pub expanded: u64,
     pub sheet: Option<Sheet>,
     /// Scroll the focused item into view on the next draw.
@@ -162,7 +163,7 @@ impl App {
             }
             KeyCode::Enter => match self.page {
                 Page::Work => {
-                    if let Some(index) = self.focus.filter(|&index| index < 64) {
+                    if let Some(index) = self.focus.filter(|&index| index < MAX_LIST_ENTRIES) {
                         self.expanded ^= 1 << index;
                         self.reveal = true;
                     }
@@ -187,6 +188,11 @@ impl App {
             KeyCode::Char('d') => self.theme = self.theme.next(),
             _ => {}
         }
+    }
+
+    /// Whether Work row `index` is expanded.
+    pub fn is_expanded(&self, index: usize) -> bool {
+        index < MAX_LIST_ENTRIES && self.expanded & (1 << index) != 0
     }
 
     fn enter(&mut self, page: Page) {

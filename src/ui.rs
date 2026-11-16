@@ -249,7 +249,7 @@ fn work<'a>(content: &'a Portfolio, app: &App, layout: &Layout, pal: &Palette) -
             doc.blank();
         }
         let top = doc.lines.len();
-        let expanded = index < 64 && app.expanded & (1 << index) != 0;
+        let expanded = app.is_expanded(index);
         let company = text::truncate(&entry.company, w.saturating_sub(8));
         let company_w = text::width(&company);
         let inline_role = w >= 66 && 6 + company_w + 2 + 2 <= 36;
@@ -700,9 +700,7 @@ fn status<'a>(
         Some(url) => {
             let hints: &[&str] = match app.page {
                 Page::Work => {
-                    let open = app
-                        .focus
-                        .is_some_and(|index| index < 64 && app.expanded & (1 << index) != 0);
+                    let open = app.focus.is_some_and(|index| app.is_expanded(index));
                     if open {
                         &["↵ collapse", "o link"]
                     } else {
