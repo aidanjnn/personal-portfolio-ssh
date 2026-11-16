@@ -1,6 +1,7 @@
 use std::{error::Error, fmt, ops::Deref};
 
 use serde::{Deserialize, Serialize};
+use unicode_properties::{GeneralCategory, UnicodeEmoji, UnicodeGeneralCategory};
 
 pub const BUNDLED_JSON: &str = include_str!("../content/portfolio.json");
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
@@ -302,12 +303,55 @@ fn validate_text(field: &str, text: &str, maximum: usize) -> Result<(), ContentE
     reject_unsafe_chars(field, text)
 }
 
+const ZWJ: char = '\u{200d}';
+const VS16: char = '\u{fe0f}';
+/// Hangul fillers are letters (Lo) that draw nothing, so no category rule catches them.
+const HANGUL_FILLERS: [char; 4] = ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'];
+
+/// U+FDD0–U+FDEF and the last two code points of every plane.
+fn is_noncharacter(ch: char) -> bool {
+    let code = u32::from(ch);
+    (0xfdd0..=0xfdef).contains(&code) || code & 0xfffe == 0xfffe
+}
+
+/// Rejected by whole category: controls (Cc: C0, DEL, C1), format characters (Cf: bidi
+/// overrides, soft hyphen, tags, invisible operators, …), surrogates (Cs), private use (Co),
+/// unassigned code points (Cn, which covers noncharacters), and the line and paragraph
+/// separators (Zl, Zp). Categories come from the `unicode-properties` tables.
+fn is_unsafe_char(ch: char) -> bool {
+    use GeneralCategory::*;
+    matches!(
+        ch.general_category(),
+        Control | Format | Surrogate | PrivateUse | Unassigned | LineSeparator | ParagraphSeparator
+    ) || is_noncharacter(ch)
+        || HANGUL_FILLERS.contains(&ch)
+}
+
+/// ASCII digits, `#` and `*` are Emoji=Yes only as keycap bases, which never take a ZWJ.
+fn is_emoji(ch: char) -> bool {
+    !ch.is_ascii() && ch.is_emoji_char()
+}
+
+/// Rejects characters that could drive the terminal or hide text. The one Cf character kept is
+/// U+200D ZERO WIDTH JOINER, and only inside an emoji ZWJ sequence (👩‍💻, ❤️‍🔥): right after an
+/// emoji (optionally with VS16) and right before another. Those sequences are common in written
+/// text and render as one glyph; anywhere else a ZWJ is just an invisible character.
 fn reject_unsafe_chars(field: &str, text: &str) -> Result<(), ContentError> {
-    if text.chars().any(|ch| {
-        ch.is_control()
-            || matches!(ch, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
-    }) {
-        return Err(ContentError(format!("{field} contains terminal control or invisible formatting characters")));
+    let mut after_emoji = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let safe = if ch == ZWJ {
+            after_emoji && chars.peek().is_some_and(|&next| is_emoji(next))
+        } else {
+            !is_unsafe_char(ch)
+        };
+        if !safe {
+            return Err(ContentError(format!(
+                "{field} contains a terminal control or invisible character (U+{:04X})",
+                u32::from(ch)
+            )));
+        }
+        after_emoji = is_emoji(ch) || (after_emoji && ch == VS16);
     }
     Ok(())
 }
@@ -434,6 +478,76 @@ mod tests {
             let mut content = bundled_data();
             content.thoughts[0].sections[0].items[0].text = unsafe_text.into();
             assert!(content.validate().is_err(), "accepted {unsafe_text:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_whole_categories_of_invisible_and_control_characters() {
+        // Every character named in review, through the full content validator.
+        let named = [
+            // C0, DEL, C1
+            "\u{0} \u{1b} \u{7f} \u{85} \u{9b}",
+            // Cf: soft hyphen, Arabic letter mark, Mongolian vowel separator, zero-width and
+            // bidi controls, BOM, tags, interlinear annotations, musical format controls
+            "\u{ad} \u{61c} \u{180e} \u{200b} \u{200c} \u{200e} \u{202e} \u{2066} \u{feff}",
+            "\u{e0001} \u{e0020} \u{e007f} \u{fff9} \u{fffa} \u{fffb} \u{1d173} \u{1d17a}",
+            // Zl, Zp; Hangul fillers
+            "\u{2028} \u{2029} \u{115f} \u{1160} \u{3164} \u{ffa0}",
+            // Co (BMP, planes 15 and 16), Cn, noncharacters
+            "\u{e000} \u{f8ff} \u{f0000} \u{ffffd} \u{100000} \u{10fffd} \u{378} \u{e0000}",
+            "\u{fdd0} \u{fdef} \u{fffe} \u{ffff} \u{1fffe} \u{10ffff}",
+        ];
+        for ch in named.iter().flat_map(|group| group.split(' ')) {
+            let mut content = bundled_data();
+            content.thoughts[0].sections[0].items[0].text = format!("a{ch}b");
+            assert!(content.validate().is_err(), "accepted {ch:?}");
+            let mut content = bundled_data();
+            content.intro[0][0].text = format!("a{ch}b");
+            assert!(content.validate().is_err(), "accepted {ch:?}");
+        }
+        // Whole ranges, through the character check alone.
+        let ranges = [
+            '\u{0}'..='\u{1f}',
+            '\u{7f}'..='\u{9f}',
+            '\u{e0000}'..='\u{e007f}',
+            '\u{fff9}'..='\u{fffb}',
+            '\u{1d173}'..='\u{1d17a}',
+            '\u{e000}'..='\u{f8ff}',
+            '\u{f0000}'..='\u{10ffff}',
+            '\u{fdd0}'..='\u{fdef}',
+        ];
+        let noncharacters = (0..=16).flat_map(|plane| {
+            [0xfffe, 0xffff].map(|low| char::from_u32((plane << 16) | low).unwrap())
+        });
+        for ch in ranges.into_iter().flatten().chain(noncharacters) {
+            assert!(
+                reject_unsafe_chars("t", &format!("a{ch}b")).is_err(),
+                "{ch:?}"
+            );
+        }
+        for text in [
+            "José",
+            "Jose\u{301}",
+            "漢字 かな 한국어",
+            "café ☕ 👋🏽",
+            "\u{2764}\u{fe0f}",
+            "👩\u{200d}💻",
+            "\u{2764}\u{fe0f}\u{200d}🔥",
+            "🏳\u{fe0f}\u{200d}🌈",
+            "👩🏽\u{200d}🤝\u{200d}👨🏻",
+        ] {
+            assert!(validate_text("t", text, 64).is_ok(), "rejected {text:?}");
+        }
+        // ZWJ outside an emoji sequence is just an invisible character.
+        for text in [
+            "a\u{200d}b",
+            "\u{200d}👩",
+            "👩\u{200d}",
+            "👩\u{200d}\u{200d}💻",
+            "1\u{200d}👩",
+            "👩\u{200d}x",
+        ] {
+            assert!(validate_text("t", text, 64).is_err(), "accepted {text:?}");
         }
     }
 
