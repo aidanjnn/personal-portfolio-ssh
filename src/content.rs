@@ -28,6 +28,8 @@ pub struct Portfolio(PortfolioData);
 #[serde(deny_unknown_fields)]
 pub struct PortfolioData {
     pub version: u8,
+    /// Required, but may be `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub updated: Option<String>,
     pub name: String,
     pub web: String,
@@ -44,6 +46,8 @@ pub struct PortfolioData {
 pub struct Span {
     pub text: String,
     pub style: SpanStyle,
+    /// Required, but may be `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub url: Option<String>,
 }
 
@@ -76,6 +80,8 @@ pub struct Work {
 pub struct Project {
     pub slug: String,
     pub title: String,
+    /// Required, but may be `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub event: Option<String>,
     pub summary: String,
     pub year: u16,
@@ -104,6 +110,8 @@ pub struct ThoughtSection {
 #[serde(deny_unknown_fields)]
 pub struct ThoughtItem {
     pub text: String,
+    /// Required, but may be `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub url: Option<String>,
 }
 
@@ -676,15 +684,175 @@ mod tests {
             MAX_LIST_ENTRIES
         );
         let snapshot: serde_json::Value = serde_json::from_str(BUNDLED_JSON).unwrap();
-        let required: Vec<&str> = schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|key| key.as_str().unwrap())
-            .collect();
-        for (key, _) in snapshot.as_object().unwrap() {
-            assert!(required.contains(&key.as_str()), "schema missing {key}");
+
+        // Every object in the contract: the schema requires exactly the properties it declares
+        // and the snapshot has, Rust rejects the snapshot without any one of them, and Rust
+        // accepts `null` exactly where the schema does.
+        let thought = &properties["thoughts"]["items"];
+        let section = &thought["properties"]["sections"]["items"];
+        let span = &properties["intro"]["items"]["items"]["$ref"];
+        let span = schema.pointer(span.as_str().unwrap().trim_start_matches('#'));
+        let objects = [
+            ("", &schema),
+            ("/intro/0/0", span.unwrap()),
+            ("/work/0", &properties["work"]["items"]),
+            ("/projects/0", &properties["projects"]["items"]),
+            ("/thoughts/0", thought),
+            ("/thoughts/0/sections/0", section),
+            (
+                "/thoughts/0/sections/0/items/0",
+                &section["properties"]["items"]["items"],
+            ),
+            ("/webring", &properties["webring"]),
+        ];
+        let keys = |value: &serde_json::Value| {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        for (path, object) in objects {
+            assert_eq!(object["additionalProperties"], false, "{path}");
+            let declared = keys(&object["properties"]);
+            let mut required: Vec<String> =
+                serde_json::from_value(object["required"].clone()).unwrap();
+            required.sort();
+            assert_eq!(required, declared, "{path}: schema required vs properties");
+            assert_eq!(
+                keys(snapshot.pointer(path).unwrap()),
+                declared,
+                "{path}: snapshot"
+            );
+            for key in required {
+                let mut json = snapshot.clone();
+                let fields = json.pointer_mut(path).unwrap().as_object_mut().unwrap();
+                fields.remove(&key);
+                assert!(
+                    Portfolio::from_json(&json.to_string()).is_err(),
+                    "Rust accepts {path} without {key}"
+                );
+                let nullable = object["properties"][&key]["oneOf"]
+                    .as_array()
+                    .is_some_and(|options| options.iter().any(|option| option["type"] == "null"));
+                let fields = json.pointer_mut(path).unwrap().as_object_mut().unwrap();
+                fields.insert(key.clone(), serde_json::Value::Null);
+                assert_eq!(
+                    Portfolio::from_json(&json.to_string()).is_ok(),
+                    nullable,
+                    "{path}.{key} = null"
+                );
+            }
         }
+
+        // Sample strings through the schema's pattern and length bounds and through Rust.
+        let schema_accepts = |def: &str, text: &str| {
+            let def = &schema["$defs"][def];
+            let pattern = regex::Regex::new(def["pattern"].as_str().unwrap()).unwrap();
+            let length = text.chars().count() as u64;
+            pattern.is_match(text)
+                && def["minLength"].as_u64().is_none_or(|min| length >= min)
+                && def["maxLength"].as_u64().is_none_or(|max| length <= max)
+        };
+        let label = "a".repeat(63);
+        let long_path = format!("https://example.com/{}", "a".repeat(URL_LIMIT - 20));
+        let urls = [
+            "https://example.com",
+            "https://www.example.com/",
+            "https://example.com/path?a=b#fragment",
+            "https://example.com/some%20path",
+            "https://EXAMPLE.co.uk/a-b_c~d.e:f@g!h$i&j'k(l)m*n+o,p;q=r[s]",
+            "https://example.com?query",
+            "https://example.com#fragment",
+            "https://1.2.3.4/",
+            "https://a-b.example/",
+            "mailto:user+portfolio@example.com",
+            "mailto:first.last-x_y@mail.example.com",
+            &format!("https://{label}.com"),
+            &long_path,
+            &format!("{long_path}a"),
+            &format!("https://{label}a.com"),
+            "",
+            "https://",
+            "https://example",
+            "https://example.com:8080/",
+            "https://user@example.com",
+            "https://good.com@evil.com",
+            "https://ex_ample.com",
+            "https://-example.com",
+            "https://example-.com",
+            "https://example..com",
+            "https://.example.com",
+            "https://example.com.",
+            "https://example.com/a b",
+            "https://example.com/a%xx",
+            "https://example.com/a%2",
+            "https://example.com/\"<>",
+            "https://example.com/{}|^`",
+            "https://example.com/\\evil",
+            "https://example.com/ü",
+            "https://example.com\x1b]8;;",
+            "https://example.com\n",
+            " https://example.com",
+            "HTTPS://example.com",
+            "http://example.com",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "mailto:user@example.com?body=hello",
+            "mailto:@example.com",
+            "mailto:user@example",
+            "mailto:us er@example.com",
+            "mailto:user@@example.com",
+            "mailto:user@a.com@b.com",
+            "mailto:user%40@example.com",
+        ];
+        for url in urls {
+            assert_eq!(
+                schema_accepts("url", url),
+                validate_url("url", url).is_ok(),
+                "schema and Rust disagree on {url:?}"
+            );
+        }
+        // Text the schema can describe (no control or invisible characters).
+        let texts = [
+            "a",
+            " a ",
+            "Aidan Jeon",
+            "漢字",
+            "",
+            " ",
+            "\u{3000}",
+            "\u{a0}",
+        ];
+        let long = ["a", "漢"].map(|ch| (ch.repeat(SHORT_TEXT_LIMIT), ch.repeat(BODY_TEXT_LIMIT)));
+        for text in texts.iter().copied().chain(
+            long.iter()
+                .flat_map(|(short, body)| [short.as_str(), body.as_str()]),
+        ) {
+            for (def, limit) in [
+                ("shortText", SHORT_TEXT_LIMIT),
+                ("bodyText", BODY_TEXT_LIMIT),
+            ] {
+                for text in [text.to_string(), format!("{text}b")] {
+                    assert_eq!(
+                        schema_accepts(def, &text),
+                        validate_text("t", &text, limit).is_ok(),
+                        "schema {def} and Rust disagree on {text:?}"
+                    );
+                }
+            }
+        }
+        let max_slug = "a".repeat(64);
+        let long_slug = "a".repeat(65);
+        for slug in [
+            "a", "a-b", "ab-12-c", &max_slug, &long_slug, "", "-a", "a-", "a--b", "A", "a_b",
+            "a b", "é",
+        ] {
+            assert_eq!(
+                schema_accepts("slug", slug),
+                validate_slug("slug", slug).is_ok(),
+                "schema and Rust disagree on slug {slug:?}"
+            );
+        }
+
         let encoded = serde_json::to_string(&Portfolio::bundled().unwrap()).unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),

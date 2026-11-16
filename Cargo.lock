@@ -807,6 +807,7 @@ dependencies = [
  "crossterm",
  "rand 0.10.2",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "unicode-properties",
