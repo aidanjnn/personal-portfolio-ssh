@@ -962,6 +962,35 @@ fn combining_marks_join_the_previous_cell() {
 }
 
 #[test]
+fn emoji_clusters_fill_the_cells_ratatui_skips() {
+    use ratatui::buffer::CellWidth;
+    let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+    let end = put(
+        &mut buf,
+        0,
+        0,
+        "\u{2764}\u{fe0f}👩\u{200d}💻x",
+        Style::default(),
+        10,
+    );
+    assert_eq!(end, 5);
+    assert_eq!(buf[(0, 0)].symbol(), "\u{2764}\u{fe0f}");
+    assert_eq!(buf[(2, 0)].symbol(), "👩\u{200d}💻");
+    assert_eq!(buf[(4, 0)].symbol(), "x");
+    // ratatui's diff skips `cell_width - 1` cells after each symbol; they must be the blank
+    // continuation cells, or the terminal and the buffer disagree about every later column.
+    for x in [0, 2] {
+        assert_eq!(buf[(x, 0)].cell_width(), 2);
+        assert_eq!(buf[(x + 1, 0)].symbol(), " ");
+    }
+    // A cluster that does not fit whole is not drawn.
+    assert_eq!(
+        put(&mut buf, 0, 0, "ab\u{2764}\u{fe0f}", Style::default(), 3),
+        2
+    );
+}
+
+#[test]
 fn compact_header_drops_nav_labels_that_do_not_fit_whole() {
     let content = content();
     for cols in [32, 34, 38] {

@@ -424,14 +424,14 @@ fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style, limit: u16) -
         return x;
     }
     let mut cx = x;
-    // The cell holding the last glyph written, which zero-width marks join.
+    // The cell holding the last cluster written. Combining marks arrive inside their base's
+    // cluster; only a cluster that draws nothing itself (marks with no base) joins this cell.
     let mut last = None;
-    for ch in text.chars() {
-        let w = text::char_width(ch);
+    for (cluster, w) in text::clusters(text) {
         if w == 0 {
             if let Some(lx) = last {
                 let cell = &mut buf[(lx, y)];
-                let symbol = format!("{}{ch}", cell.symbol());
+                let symbol = format!("{}{cluster}", cell.symbol());
                 cell.set_symbol(&symbol);
             }
             continue;
@@ -440,7 +440,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style, limit: u16) -
             break;
         }
         last = Some(cx);
-        buf[(cx, y)].set_char(ch).set_style(style);
+        buf[(cx, y)].set_symbol(cluster).set_style(style);
         for k in 1..w {
             let cell = &mut buf[(cx + k, y)];
             cell.reset();

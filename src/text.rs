@@ -1,6 +1,7 @@
 //! Cell-accurate word wrapping of styled spans that remembers where each tagged span landed.
-use ratatui::style::Style;
-use unicode_width::UnicodeWidthChar;
+//! Text is measured by grapheme cluster, the unit a terminal cell holds.
+use ratatui::{buffer::CellWidth, style::Style};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// One styled input span. `tag` marks a focusable region (its item index).
 #[derive(Clone, Copy, Debug)]
@@ -35,34 +36,47 @@ pub struct Run {
 
 pub type Line = Vec<Run>;
 
-pub fn char_width(ch: char) -> u16 {
-    ch.width().unwrap_or(0) as u16
+/// Cells one grapheme cluster occupies, measured exactly as ratatui's buffer diff measures a
+/// cell's symbol, so a drawn cluster and the cells the terminal is told to skip agree
+/// (emoji + U+FE0F and ZWJ sequences are 2 cells, a letter with combining marks is 1).
+pub fn cluster_width(cluster: &str) -> u16 {
+    // Validated content has no control characters; never trip ratatui's debug assertion on one.
+    if cluster.len() == 1 && cluster.as_bytes()[0].is_ascii_control() {
+        return 0;
+    }
+    cluster.cell_width()
+}
+
+/// The grapheme clusters of `text` with their widths.
+pub fn clusters(text: &str) -> impl Iterator<Item = (&str, u16)> {
+    text.graphemes(true)
+        .map(|cluster| (cluster, cluster_width(cluster)))
 }
 
 pub fn width(text: &str) -> u16 {
-    text.chars()
-        .map(|ch| char_width(ch) as usize)
+    clusters(text)
+        .map(|(_, width)| usize::from(width))
         .sum::<usize>()
-        .min(u16::MAX as usize) as u16
+        .min(usize::from(u16::MAX)) as u16
 }
 
 #[derive(Clone, Copy)]
-struct Cell {
-    ch: char,
+struct Cell<'a> {
+    text: &'a str,
     width: u16,
     style: Style,
     tag: Option<usize>,
 }
 
-/// Word-wraps `pieces` to `max` cells. Only spaces break; longer words break by character.
+/// Word-wraps `pieces` to `max` cells. Only spaces break; longer words break by cluster.
 pub fn wrap(pieces: &[Piece], max: u16) -> Vec<Line> {
     let max = max.max(1);
     let cells: Vec<Cell> = pieces
         .iter()
         .flat_map(|piece| {
-            piece.text.chars().map(move |ch| Cell {
-                ch,
-                width: char_width(ch),
+            clusters(piece.text).map(move |(text, width)| Cell {
+                text,
+                width,
                 style: piece.style,
                 tag: piece.tag,
             })
@@ -72,17 +86,17 @@ pub fn wrap(pieces: &[Piece], max: u16) -> Vec<Line> {
     let mut used = 0u16;
     let mut index = 0;
     while index < cells.len() {
-        if cells[index].ch == ' ' {
+        if cells[index].text == " " {
             index += 1;
             continue;
         }
         // Spaces before this word, then the word itself.
         let mut gap_start = index;
-        while gap_start > 0 && cells[gap_start - 1].ch == ' ' {
+        while gap_start > 0 && cells[gap_start - 1].text == " " {
             gap_start -= 1;
         }
         let mut end = index;
-        while end < cells.len() && cells[end].ch != ' ' {
+        while end < cells.len() && cells[end].text != " " {
             end += 1;
         }
         let gap = &cells[gap_start..index];
@@ -115,10 +129,12 @@ fn merge(cells: Vec<Cell>) -> Line {
     let mut x = 0u16;
     for cell in cells {
         match runs.last_mut() {
-            Some(run) if run.style == cell.style && run.tag == cell.tag => run.text.push(cell.ch),
+            Some(run) if run.style == cell.style && run.tag == cell.tag => {
+                run.text.push_str(cell.text)
+            }
             _ => runs.push(Run {
                 x,
-                text: cell.ch.to_string(),
+                text: cell.text.to_string(),
                 style: cell.style,
                 tag: cell.tag,
             }),
@@ -128,18 +144,17 @@ fn merge(cells: Vec<Cell>) -> Line {
     runs
 }
 
-/// Breaks `text` by character into rows of at most `max` cells.
+/// Breaks `text` by cluster into rows of at most `max` cells.
 pub fn chunk(text: &str, max: u16) -> Vec<String> {
     let max = max.max(1);
     let mut rows = vec![String::new()];
     let mut used = 0;
-    for ch in text.chars() {
-        let w = char_width(ch);
+    for (cluster, w) in clusters(text) {
         if used + w > max && used > 0 {
             rows.push(String::new());
             used = 0;
         }
-        rows.last_mut().unwrap().push(ch);
+        rows.last_mut().unwrap().push_str(cluster);
         used += w;
     }
     rows
@@ -149,12 +164,11 @@ pub fn chunk(text: &str, max: u16) -> Vec<String> {
 pub fn prefix(text: &str, max: u16) -> String {
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let w = char_width(ch);
+    for (cluster, w) in clusters(text) {
         if used + w > max {
             break;
         }
-        out.push(ch);
+        out.push_str(cluster);
         used += w;
     }
     out
@@ -232,5 +246,34 @@ mod tests {
         assert_eq!(chunk("abcdef", 4), ["abcd", "ef"]);
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    #[test]
+    fn clusters_are_measured_whole() {
+        let heart = "\u{2764}\u{fe0f}"; // ❤️: a 1-cell character made 2 cells by VS16
+        let coder = "👩\u{200d}💻";
+        assert_eq!(width(heart), 2);
+        assert_eq!(width(coder), 2);
+        assert_eq!(width("👋🏽"), 2);
+        assert_eq!(width("Jose\u{301}"), 4);
+        assert_eq!(
+            width("\u{2764}\u{fe0e}"),
+            1,
+            "text presentation stays narrow"
+        );
+        // Wrapping, chunking and truncation never split a cluster.
+        let text = format!("{heart}{heart}{coder}e\u{301}");
+        assert_eq!(chunk(&text, 3), [heart, heart, &format!("{coder}e\u{301}")]);
+        assert_eq!(prefix(&text, 3), heart);
+        assert_eq!(truncate(&text, 4), format!("{heart}…"));
+        let lines = wrap(&[Piece::new(&format!("ab {text}"), Style::new())], 4);
+        assert_eq!(
+            plain(&lines),
+            [
+                "ab",
+                &format!("{heart}{heart}"),
+                &format!("{coder}e\u{301}")
+            ]
+        );
     }
 }
