@@ -236,11 +236,40 @@ jobs:
           # node's host key. If Tailscale SSH were off, this would reach the
           # portfolio instead, which rejects exec, so the step fails safely.
           #
-          # The script below runs on the VM. It touches only the portfolio
-          # service: Caddy keeps running whatever happens.
+          # The rollout touches only the portfolio service: Caddy keeps running
+          # whatever happens.
+          #
+          # It runs detached from this SSH session, so a connection that drops
+          # halfway (a lost runner, a tailnet blip) cannot kill it between
+          # stopping the old container and the health check: it still ends
+          # healthy or rolled back. Over the session, a short launcher saves the
+          # rollout to a file and starts it with setsid, in its own session and
+          # process group, with SIGHUP and SIGPIPE ignored and its output going
+          # to a log file rather than to this connection. The launcher streams
+          # that log back and exits with the rollout's status, so the step still
+          # shows every line and fails when the rollout does. If the session
+          # drops, the step fails but the rollout carries on; re-running the job
+          # waits on its lock, then redeploys the same digest.
+          #
+          # Not systemd-run: `deploy` is not root, so it cannot start system
+          # units; a --user unit stops with the user's last session unless
+          # lingering is enabled; and --pipe would tie the unit's input and
+          # output to this very connection.
           ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
             "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s -- "$IMAGE_REF" <<'REMOTE'
           set -euo pipefail
+          # Logs of earlier rollouts are kept for a month, for post-mortems.
+          find "$HOME" -maxdepth 1 -type d -name 'rollout-*' -mtime +30 -exec rm -rf {} + || true
+          run=$(mktemp -d "$HOME/rollout-XXXXXX")
+          cat > "$run/rollout.sh" <<'ROLLOUT'
+          set -euo pipefail
+          trap '' HUP PIPE
+          # One rollout at a time, including one a dropped session left running.
+          exec 9>"$HOME/.rollout.lock"
+          if ! flock -w 600 9; then
+            echo "::error::An earlier rollout still holds $HOME/.rollout.lock"
+            exit 1
+          fi
           new=$1
           repo=${new%@*}
           cd /opt/portfolio
@@ -282,6 +311,12 @@ jobs:
             echo "::error::The rollback to $prev is not healthy either. Check the VM."
           fi
           exit 1
+          ROLLOUT
+          : > "$run/log"
+          setsid --wait bash "$run/rollout.sh" "$1" > "$run/log" 2>&1 < /dev/null &
+          rollout=$!
+          tail -n +1 -f --pid="$rollout" "$run/log"
+          wait "$rollout"
           REMOTE
 
       - name: Smoke test public SSH
