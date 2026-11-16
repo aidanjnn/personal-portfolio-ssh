@@ -1,9 +1,17 @@
 use super::*;
+use crate::content::PortfolioData;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 
 pub(crate) fn content() -> Portfolio {
     Portfolio::bundled().unwrap()
+}
+
+/// The bundled content after `edit`, validated again.
+pub(crate) fn edited(edit: impl FnOnce(&mut PortfolioData)) -> Portfolio {
+    let mut data = content().into_data();
+    edit(&mut data);
+    Portfolio::new(data).unwrap()
 }
 
 /// Renders `app` once at `cols`×`rows`.
@@ -188,7 +196,7 @@ fn golden_compact_40x16() {
     let expected = mockup(6);
     assert_rows("compact", &actual, &expected, &[0, 1, 14]);
     // The Updated label (kept per the spec) shifts the prose down two rows.
-    let updated = content().updated.unwrap();
+    let updated = content().updated.clone().unwrap();
     assert_eq!(actual[2], format!("  {updated}"));
     for row in 2..=11 {
         assert_eq!(actual[row + 2], expected[row], "compact row {row}");
@@ -568,8 +576,9 @@ fn sheets_carry_their_links() {
 
 #[test]
 fn long_urls_wrap_in_the_link_sheet() {
-    let mut content = content();
-    content.projects[0].url = format!("https://example.com/{}", "a".repeat(400));
+    let content = edited(|data| {
+        data.projects[0].url = format!("https://example.com/{}", "a".repeat(400));
+    });
     let mut app = App::default();
     key(&mut app, KeyCode::Char('p'));
     render(&mut app, &content, 80, 24);

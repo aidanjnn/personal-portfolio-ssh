@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, ops::Deref};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +13,18 @@ const URL_LIMIT: usize = 2048;
 pub const MAX_LIST_ENTRIES: usize = 64;
 const _: () = assert!(MAX_LIST_ENTRIES <= u64::BITS as usize);
 
-/// Public portfolio content, contract v2. The website serves it at /portfolio.json.
+/// Content that passed `PortfolioData::validate`. The field is private and the type does not
+/// implement `Deserialize`, so `from_json`, `bundled` and `new` are the only ways to get one, and
+/// the renderer accepts nothing else. Fields are read through `Deref`.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(transparent)]
+pub struct Portfolio(PortfolioData);
+
+/// Public portfolio content as parsed, contract v2. The website serves it at /portfolio.json.
+/// Unvalidated: wrap it with `Portfolio::new` before rendering it.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Portfolio {
+pub struct PortfolioData {
     pub version: u8,
     pub updated: Option<String>,
     pub name: String,
@@ -127,12 +135,33 @@ impl Portfolio {
                 "content exceeds the 1 MiB snapshot limit".into(),
             ));
         }
-        let content: Self = serde_json::from_str(json)
+        let data: PortfolioData = serde_json::from_str(json)
             .map_err(|error| ContentError(format!("invalid portfolio JSON: {error}")))?;
-        content.validate()?;
-        Ok(content)
+        Self::new(data)
     }
 
+    /// Validates `data`; the only constructor besides parsing.
+    pub fn new(data: PortfolioData) -> Result<Self, ContentError> {
+        data.validate()?;
+        Ok(Self(data))
+    }
+
+    /// Gives up the validation guarantee so tests can edit content and validate it again.
+    #[cfg(test)]
+    pub fn into_data(self) -> PortfolioData {
+        self.0
+    }
+}
+
+impl Deref for Portfolio {
+    type Target = PortfolioData;
+
+    fn deref(&self) -> &PortfolioData {
+        &self.0
+    }
+}
+
+impl PortfolioData {
     pub fn validate(&self) -> Result<(), ContentError> {
         if self.version != CONTENT_VERSION {
             return Err(ContentError(format!(
@@ -350,6 +379,22 @@ fn validate_url(field: &str, url: &str) -> Result<(), ContentError> {
 mod tests {
     use super::*;
 
+    fn bundled_data() -> PortfolioData {
+        Portfolio::bundled().unwrap().into_data()
+    }
+
+    #[test]
+    fn parsed_content_is_only_renderable_after_validation() {
+        // Parsing alone yields `PortfolioData`; `Portfolio` (what `ui::draw` takes) has no
+        // `Deserialize`, so invalid content can only be wrapped through `Portfolio::new`.
+        let invalid = BUNDLED_JSON.replacen("https://www.copperlane.ai/", "javascript:x", 1);
+        let data: PortfolioData = serde_json::from_str(&invalid).unwrap();
+        assert!(Portfolio::new(data).is_err());
+        assert!(Portfolio::from_json(&invalid).is_err());
+        let data = bundled_data();
+        assert_eq!(*Portfolio::new(data.clone()).unwrap(), data);
+    }
+
     #[test]
     fn bundled_content_matches_the_website() {
         let portfolio = Portfolio::bundled().unwrap();
@@ -383,10 +428,10 @@ mod tests {
             "hello\u{202e}world",
             "hello\u{200b}world",
         ] {
-            let mut content = Portfolio::bundled().unwrap();
+            let mut content = bundled_data();
             content.intro[0][0].text = unsafe_text.into();
             assert!(content.validate().is_err(), "accepted {unsafe_text:?}");
-            let mut content = Portfolio::bundled().unwrap();
+            let mut content = bundled_data();
             content.thoughts[0].sections[0].items[0].text = unsafe_text.into();
             assert!(content.validate().is_err(), "accepted {unsafe_text:?}");
         }
@@ -420,7 +465,7 @@ mod tests {
         ] {
             assert!(validate_url("url", url).is_ok(), "rejected {url:?}");
         }
-        let mut content = Portfolio::bundled().unwrap();
+        let mut content = bundled_data();
         content.intro[0][1].url = Some("javascript:alert(1)".into());
         assert!(content.validate().is_err());
     }
@@ -437,7 +482,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_lengths_years_and_slugs() {
-        let mut content = Portfolio::bundled().unwrap();
+        let mut content = bundled_data();
         content.projects[0].year = 1;
         assert!(content.validate().is_err());
         content.projects[0].year = 2026;
@@ -451,7 +496,7 @@ mod tests {
         content.projects[0].slug = "ok-slug".into();
         content.projects.clear();
         assert!(content.validate().is_err());
-        let mut content = Portfolio::bundled().unwrap();
+        let mut content = bundled_data();
         content.intro[0] = vec![Span {
             text: "  ".into(),
             style: SpanStyle::Plain,
