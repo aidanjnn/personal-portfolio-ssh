@@ -1,4 +1,4 @@
-use crate::{app::App, content::Portfolio, input::Decoder, ui};
+use crate::{app::App, content::Portfolio, input::Decoder, store::ContentStore, ui};
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 use russh::{
     Channel, ChannelId, ChannelMsg, Disconnect, Pty,
@@ -63,6 +63,7 @@ pub struct Config {
     pub max_session: Duration,
     /// Not a flag: tests shorten it.
     pub setup_timeout: Duration,
+    pub content_url: Option<String>,
     pub links: bool,
 }
 
@@ -76,6 +77,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(300),
             max_session: Duration::from_secs(1800),
             setup_timeout: SETUP_TIMEOUT,
+            content_url: None,
             links: true,
         }
     }
@@ -127,13 +129,14 @@ async fn run_server(
         config.max_sessions,
         config.max_per_ip
     );
-    let content = Arc::new(content);
+    let store = ContentStore::new(content, config.content_url.clone());
     let mut gate = Gate::new(config.max_per_ip, config.max_sessions, Instant::now());
     let log = Arc::new(Log::new(Instant::now()));
     let mut summaries = tokio::time::interval(SUMMARY_INTERVAL);
     let busy: Arc<[u8]> = busy_reply(&ssh_config.server_id).into();
     let refusing = Arc::new(Semaphore::new(MAX_REFUSING));
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let refresher = tokio::spawn(store.clone().run(shutdown_rx.clone()));
     let mut connections = JoinSet::new();
     tokio::pin!(stop);
     loop {
@@ -177,7 +180,7 @@ async fn run_server(
                     shutdown: shutdown_rx.clone(),
                 };
                 let handler = Visitor::new(
-                    Arc::clone(&content),
+                    store.snapshot(),
                     limits,
                     config.links,
                     Arc::clone(&record),
@@ -218,6 +221,10 @@ async fn run_server(
     // Every connection ends within a bounded time (Connection::run), so this cannot hang.
     while connections.join_next().await.is_some() {}
     log.summarize();
+    // The refresher's loop ends as soon as it sees `shutdown`, so this returns at once. A
+    // fetch it started keeps running on Tokio's blocking pool, and the runtime would wait for
+    // it when dropped; `main` bounds that wait with `shutdown_timeout`.
+    let _ = refresher.await;
     Ok(())
 }
 

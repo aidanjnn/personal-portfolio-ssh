@@ -2,6 +2,7 @@ mod app;
 mod content;
 mod input;
 mod ssh;
+mod store;
 mod text;
 mod theme;
 mod ui;
@@ -9,19 +10,38 @@ mod ui;
 use crossterm::event::{self, Event};
 use std::{
     ffi::OsStr,
-    io::{self, IsTerminal, Write},
+    future::Future,
+    io::{self, IsTerminal, Read, Write},
     time::Duration,
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// How long the server's exit waits for blocking work still running, such as a content
+/// fetch, which can take up to `store::FETCH_TIMEOUT`.
+const RUNTIME_SHUTDOWN: Duration = Duration::from_millis(500);
+
 fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n  personal-portfolio-tui serve [OPTIONS]\n\nServer options:\n  --bind ADDRESS           Listen address (default 127.0.0.1:2222)\n  --host-key PATH          Persistent Ed25519 key (default data/ssh_host_ed25519_key)\n  --max-sessions COUNT     Concurrent connections, 1–256 (default 32)\n  --max-per-ip COUNT       Concurrent connections per client address, 1–32 (default 3)\n  --idle-timeout SECS      Input inactivity timeout, 1–3600 (default 300)\n  --max-session-secs SECS  Hard session length, 60–86400 (default 1800)\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nAnonymous SSH only runs the portfolio. PTY required; no commands or forwarding.\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
+            "Aidan Jeon's terminal portfolio\n\nUsage:\n  personal-portfolio-tui [--no-links]\n  personal-portfolio-tui --print-content\n  personal-portfolio-tui --check-content FILE|-\n  personal-portfolio-tui serve [OPTIONS]\n\nServer options:\n  --bind ADDRESS           Listen address (default 127.0.0.1:2222)\n  --host-key PATH          Persistent Ed25519 key (default data/ssh_host_ed25519_key)\n  --max-sessions COUNT     Concurrent connections, 1–256 (default 32)\n  --max-per-ip COUNT       Concurrent connections per client address, 1–32 (default 3)\n  --idle-timeout SECS      Input inactivity timeout, 1–3600 (default 300)\n  --max-session-secs SECS  Hard session length, 60–86400 (default 1800)\n  --content-url URL        HTTPS portfolio.json to refresh from once a minute\n  --no-links               Disable OSC 8 hyperlinks; readable URLs remain\n\nAnonymous SSH only runs the portfolio. PTY required; no commands or forwarding.\nh w p t: pages | j/k, Tab: move | Enter: open / expand | o / c: show / copy link\nd: theme | ?: keys and credits | Esc: back | q / Ctrl+C: quit"
         );
         return Ok(());
+    }
+    if let [flag, path] = args.as_slice()
+        && flag == "--check-content"
+    {
+        return match read_snapshot(path).and_then(|raw| check_content(&raw)) {
+            Ok(summary) => {
+                println!("{summary}");
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("invalid portfolio content: {error}");
+                std::process::exit(1);
+            }
+        };
     }
     let content = content::Portfolio::bundled()?;
     if args == ["--print-content"] {
@@ -30,10 +50,7 @@ fn main() -> Result<(), Error> {
     }
     if args.first().is_some_and(|arg| arg == "serve") {
         let config = parse_server_args(&args[1..])?;
-        return tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(ssh::serve(config, content));
+        return block_on(ssh::serve(config, content))?;
     }
     let links = match args.as_slice() {
         [] => true,
@@ -56,6 +73,50 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
+/// Runs `future` on a new multi-threaded runtime, then gives blocking work still running at
+/// most `RUNTIME_SHUTDOWN` to finish. Dropping the runtime instead would wait for it, so an
+/// in-flight content fetch could hold up exit for its whole timeout.
+fn block_on<T>(future: impl Future<Output = T>) -> io::Result<T> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+    Ok(output)
+}
+
+/// Reads a snapshot from a file, or stdin for `-`, stopping one byte past the size cap.
+fn read_snapshot(path: &str) -> Result<Vec<u8>, Error> {
+    let limit = content::MAX_SNAPSHOT_BYTES as u64 + 1;
+    let mut raw = Vec::new();
+    if path == "-" {
+        io::stdin().take(limit).read_to_end(&mut raw)?;
+    } else {
+        std::fs::File::open(path)?
+            .take(limit)
+            .read_to_end(&mut raw)?;
+    }
+    Ok(raw)
+}
+
+/// Validates a snapshot exactly as the server does before serving fetched content.
+/// The website's CI runs this against the `/portfolio.json` it is about to deploy.
+fn check_content(raw: &[u8]) -> Result<String, Error> {
+    if raw.len() > content::MAX_SNAPSHOT_BYTES {
+        return Err(format!("larger than {} bytes", content::MAX_SNAPSHOT_BYTES).into());
+    }
+    let json = std::str::from_utf8(raw).map_err(|_| "not UTF-8")?;
+    let portfolio = content::Portfolio::from_json(json)?;
+    Ok(format!(
+        "portfolio.json OK: v{}, {} bytes, {} work, {} projects, {} thoughts",
+        portfolio.version,
+        raw.len(),
+        portfolio.work.len(),
+        portfolio.projects.len(),
+        portfolio.thoughts.len()
+    ))
+}
+
 fn parse_server_args(args: &[String]) -> Result<ssh::Config, Error> {
     let mut config = ssh::Config::default();
     let mut args = args.iter();
@@ -74,6 +135,10 @@ fn parse_server_args(args: &[String]) -> Result<ssh::Config, Error> {
             "--max-per-ip" => config.max_per_ip = value.parse()?,
             "--idle-timeout" => config.idle_timeout = Duration::from_secs(value.parse()?),
             "--max-session-secs" => config.max_session = Duration::from_secs(value.parse()?),
+            "--content-url" => {
+                content::validate_https_url("--content-url", value)?;
+                config.content_url = Some(value.clone());
+            }
             _ => return Err("Unknown server option; use --help.".into()),
         }
     }
@@ -130,11 +195,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exit_does_not_wait_out_a_blocking_fetch() {
+        let started = std::time::Instant::now();
+        block_on(async {
+            // A fetch stuck until its timeout, still running when the server returns.
+            drop(tokio::task::spawn_blocking(|| {
+                std::thread::sleep(store::FETCH_TIMEOUT * 2);
+            }));
+        })
+        .unwrap();
+        let waited = started.elapsed();
+        assert!(waited < store::FETCH_TIMEOUT, "exit waited {waited:?}");
+    }
+
+    #[test]
     fn server_config_defaults_to_localhost_and_rejects_unbounded_limits() {
         let config = parse_server_args(&[]).unwrap();
         assert_eq!(config.bind.to_string(), "127.0.0.1:2222");
         assert_eq!(config.max_per_ip, 3);
         assert_eq!(config.max_session, Duration::from_secs(1800));
+        assert_eq!(config.content_url, None);
         for args in [
             ["--max-sessions", "0"],
             ["--max-sessions", "257"],
@@ -160,6 +240,50 @@ mod tests {
         ] {
             assert!(parse_server_args(&[flag.into(), value.into()]).is_ok());
         }
+    }
+
+    #[test]
+    fn server_config_accepts_only_https_content_urls() {
+        let args = ["--content-url", "https://www.aidanjeon.com/portfolio.json"];
+        let config = parse_server_args(&args.map(String::from)).unwrap();
+        assert_eq!(
+            config.content_url.as_deref(),
+            Some("https://www.aidanjeon.com/portfolio.json")
+        );
+        for url in [
+            "http://www.aidanjeon.com/portfolio.json",
+            "mailto:hello@aidanjeon.com",
+            "https://localhost/portfolio.json",
+            "https://www.aidanjeon.com/a b",
+            "https://user@www.aidanjeon.com/",
+            "file:///etc/passwd",
+            "",
+        ] {
+            let error = parse_server_args(&["--content-url".into(), url.into()])
+                .err()
+                .unwrap_or_else(|| panic!("accepted {url:?}"))
+                .to_string();
+            assert!(error.contains("--content-url"), "{error}");
+            assert!(!error.contains("mailto"), "{error}");
+        }
+    }
+
+    #[test]
+    fn check_content_accepts_the_bundled_snapshot_and_rejects_bad_input() {
+        let bundled = include_bytes!("../content/portfolio.json");
+        assert!(
+            check_content(bundled)
+                .unwrap()
+                .starts_with("portfolio.json OK: v2")
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(bundled).unwrap();
+        json["work"][0]["logo"] = "x".into();
+        assert!(check_content(json.to_string().as_bytes()).is_err());
+        json["work"][0].as_object_mut().unwrap().remove("logo");
+        json["work"][0]["url"] = "/work".into();
+        assert!(check_content(json.to_string().as_bytes()).is_err());
+        assert!(check_content(&[0xff, 0xfe]).is_err());
+        assert!(check_content(&vec![b' '; content::MAX_SNAPSHOT_BYTES + 1]).is_err());
     }
 
     #[test]

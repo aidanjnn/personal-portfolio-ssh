@@ -477,11 +477,25 @@ fn valid_uri_tail(tail: &str) -> bool {
     true
 }
 
+/// Validates a snapshot source with the content URL rules, restricted to HTTPS.
+pub fn validate_https_url(field: &str, url: &str) -> Result<(), ContentError> {
+    validate_text(field, url, URL_LIMIT)?;
+    if !url.strip_prefix("https://").is_some_and(valid_https_rest) {
+        return Err(ContentError(format!("{field} must be a public HTTPS URL")));
+    }
+    Ok(())
+}
+
+/// The part of an `https://` URL after the scheme: a plain DNS hostname, then a URI tail.
+fn valid_https_rest(rest: &str) -> bool {
+    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    valid_domain(&rest[..split]) && valid_uri_tail(&rest[split..])
+}
+
 fn validate_url(field: &str, url: &str) -> Result<(), ContentError> {
     validate_text(field, url, URL_LIMIT)?;
     let valid = if let Some(rest) = url.strip_prefix("https://") {
-        let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        valid_domain(&rest[..split]) && valid_uri_tail(&rest[split..])
+        valid_https_rest(rest)
     } else if let Some(address) = url.strip_prefix("mailto:") {
         address.split_once('@').is_some_and(|(local, domain)| {
             !local.is_empty()

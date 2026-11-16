@@ -674,6 +674,7 @@ def check_ssh(binary, output, port, slow=False):
                 wait_idle()
             checks.ok("exec, sftp subsystem, no-PTY shell, remote and direct forwarding rejected")
 
+            content_url = "https://www.aidanjeon.com/portfolio.json"
             for sig in (signal.SIGTERM, signal.SIGINT):
                 live = session(f"ssh-live-{sig.name.lower()}")
                 live.wait_for(HOME)
@@ -694,13 +695,14 @@ def check_ssh(binary, output, port, slow=False):
                 assert status == 0, f"{sig.name}: visitor's ssh exited with status {status}"
                 checks.ok(f"{sig.name} with a live visitor: screen restored, restart notice, "
                           f"server exits 0 in {time.monotonic() - started:.1f}s")
-                server, _ = start()
+                server, startup = start(extra=["--content-url", content_url])
+                assert startup < 5, f"--content-url delayed startup by {startup:.1f}s"
             assert key.read_bytes() == original_key, "host key changed across restart"
             restarted = session("ssh-restarted")
             check_home(restarted, Checks("ignored"))
             restarted.quit()
             wait_idle()
-            checks.ok("restart keeps the host key and serves the bundled page")
+            checks.ok(f"restart keeps the host key; --content-url listened in {startup:.2f}s and served the bundled page")
 
             stop(server)
             server, _ = start(max_sessions=1, idle_timeout=30)
