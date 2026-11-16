@@ -30,4 +30,11 @@ curl -fsS https://www.aidanjeon.com/portfolio.json > content/portfolio.json && c
 
 Short text is at most 128 characters and body text at most 2,048. Years run from 1900 to 2100. URLs are `https://` with a plain DNS hostname, or a simple `mailto:`; credentials, ports, custom schemes and raw whitespace are rejected.
 
+### Changing the contract
+
+The website's CI validates with the released `:latest` image, not with this repo's main branch, so a contract change has to roll out in order:
+
+- **Relaxing** it (a new optional field, a higher limit, another allowed value): release the server first. The website can use the new shape only after that release is `:latest`; until then its CI rejects it, and running servers would too.
+- **Tightening** it (a new required field, a lower limit, a value no longer allowed): change the website first so it already meets the stricter rule, then release the server. Released the other way round, the server would reject the live `/portfolio.json` and keep serving its last good copy.
+
 The Sean Yang credit is part of the app (the help sheet), not the content, so it can't be dropped by a content edit.
