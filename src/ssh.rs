@@ -291,10 +291,42 @@ fn load_or_create_key(path: &Path) -> Result<russh::keys::PrivateKey, Error> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut directory = fs::DirBuilder::new();
+    directory.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
     }
+    directory.create(parent)?;
     let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    let encoded = key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?;
+    // Write a temporary file and rename it into place, so a crash never leaves a
+    // truncated key that the next start would refuse to replace.
+    let name = path.file_name().ok_or("Host key path must name a file")?;
+    let temporary = parent.join(format!(
+        ".{}.{}-{:x}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let written = write_private(&temporary, encoded.as_bytes()).and_then(|()| {
+        fs::rename(&temporary, path)?;
+        sync_directory(parent)
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written?;
+    Ok(key)
+}
+
+/// Creates `path` (it must not exist) readable only by its owner and flushes it to disk.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -303,12 +335,17 @@ fn load_or_create_key(path: &Path) -> Result<russh::keys::PrivateKey, Error> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(
-        key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?
-            .as_bytes(),
-    )?;
-    file.sync_all()?;
-    Ok(key)
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Makes a rename inside `directory` durable.
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(directory)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 fn dimensions(cols: u32, rows: u32) -> Rect {
@@ -928,5 +965,35 @@ mod tests {
         assert!(load_or_create_key(&path).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "invalid private key");
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_host_key_lands_whole_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "portfolio-key-dir-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = root.join("data").join("ssh_host_ed25519_key");
+        let key = load_or_create_key(&path).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.join("data")), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let names: Vec<_> = fs::read_dir(root.join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            ["ssh_host_ed25519_key"],
+            "temporary file left behind"
+        );
+        assert_eq!(
+            load_or_create_key(&path).unwrap().public_key(),
+            key.public_key()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
