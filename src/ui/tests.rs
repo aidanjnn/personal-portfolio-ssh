@@ -795,39 +795,42 @@ fn every_page_renders_at_every_size() {
     assert_eq!(rows[4].trim(), "Resize to at least 32×10");
 }
 
+/// Every bound key, plus one unbound key.
+const FUZZ_KEYS: [KeyCode; 26] = [
+    KeyCode::Char('h'),
+    KeyCode::Char('w'),
+    KeyCode::Char('p'),
+    KeyCode::Char('t'),
+    KeyCode::Char('j'),
+    KeyCode::Char('k'),
+    KeyCode::Char('o'),
+    KeyCode::Char('c'),
+    KeyCode::Char('d'),
+    KeyCode::Char('?'),
+    KeyCode::Char('g'),
+    KeyCode::Char('G'),
+    KeyCode::Char(' '),
+    KeyCode::Char('x'),
+    KeyCode::Up,
+    KeyCode::Down,
+    KeyCode::Left,
+    KeyCode::Right,
+    KeyCode::Tab,
+    KeyCode::BackTab,
+    KeyCode::Enter,
+    KeyCode::Esc,
+    KeyCode::Home,
+    KeyCode::End,
+    KeyCode::PageUp,
+    KeyCode::PageDown,
+];
+
 #[test]
 fn random_keys_and_resizes_never_panic() {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     let content = content();
     let mut rng = StdRng::seed_from_u64(0x5eed);
-    let codes = [
-        KeyCode::Char('h'),
-        KeyCode::Char('w'),
-        KeyCode::Char('p'),
-        KeyCode::Char('t'),
-        KeyCode::Char('j'),
-        KeyCode::Char('k'),
-        KeyCode::Char('o'),
-        KeyCode::Char('c'),
-        KeyCode::Char('d'),
-        KeyCode::Char('?'),
-        KeyCode::Char('g'),
-        KeyCode::Char('G'),
-        KeyCode::Char(' '),
-        KeyCode::Char('x'),
-        KeyCode::Up,
-        KeyCode::Down,
-        KeyCode::Left,
-        KeyCode::Right,
-        KeyCode::Tab,
-        KeyCode::BackTab,
-        KeyCode::Enter,
-        KeyCode::Esc,
-        KeyCode::Home,
-        KeyCode::End,
-        KeyCode::PageUp,
-        KeyCode::PageDown,
-    ];
+    let codes = FUZZ_KEYS;
     let mut app = App::default();
     let (mut cols, mut rows) = (80, 24);
     let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
@@ -846,6 +849,173 @@ fn random_keys_and_resizes_never_panic() {
         let _ = link_escapes(&app);
         assert!(app.scroll <= app.max_scroll, "step {step}");
     }
+}
+
+/// Content that passes validation but pushes every limit: CJK in every field, combining-mark
+/// stacks at the cap, 2,048-character URLs, 64-entry lists, a one-span intro, and a thought
+/// with no sections.
+/// List bodies are full length only for the first entry, which keeps a debug run near a second.
+fn adversarial_content() -> Portfolio {
+    use crate::content::{
+        MAX_COMBINING_MARKS, MAX_LIST_ENTRIES, Project, Span, SpanStyle, Thought, ThoughtItem,
+        ThoughtSection, Webring, Work,
+    };
+    let stack = format!("e{}", "\u{301}".repeat(MAX_COMBINING_MARKS));
+    // `chars` characters of CJK, Hangul, wide punctuation and capped stacks.
+    let text = |chars: usize| -> String {
+        let unit = format!("漢字テスト、한국어{stack}（全角） ");
+        unit.chars().cycle().take(chars).collect()
+    };
+    let body = |index: usize| if index == 0 { 2048 } else { 160 };
+    let url = |seed: usize| {
+        let head = format!("https://{seed}.example.com/%E6%BC%A2?q=");
+        format!("{head}{}", "x".repeat(2048 - head.len()))
+    };
+    let thought = |index: usize| Thought {
+        slug: format!("t-{index}"),
+        title: text(128),
+        subtitle: text(body(index)),
+        year: 2026,
+        url: url(index),
+        sections: if index == 0 {
+            Vec::new()
+        } else {
+            (0..2)
+                .map(|section| ThoughtSection {
+                    heading: text(128),
+                    items: (0..4)
+                        .map(|item| ThoughtItem {
+                            text: text(600),
+                            url: (item % 2 == 0).then(|| url(section * 10 + item)),
+                        })
+                        .collect(),
+                })
+                .collect()
+        },
+    };
+    let data = PortfolioData {
+        version: crate::content::CONTENT_VERSION,
+        updated: Some(text(128)),
+        name: text(128),
+        web: url(0),
+        intro: vec![vec![Span {
+            text: text(2048),
+            style: SpanStyle::Accent,
+            url: Some(url(1)),
+        }]],
+        work: (0..MAX_LIST_ENTRIES)
+            .map(|index| Work {
+                year: 2026,
+                company: text(128),
+                role: text(128),
+                description: text(2048),
+                url: url(index),
+            })
+            .collect(),
+        projects: (0..MAX_LIST_ENTRIES)
+            .map(|index| Project {
+                slug: format!("p-{index}"),
+                title: text(128),
+                event: Some(text(128)),
+                summary: text(body(index)),
+                year: 2026,
+                url: url(index),
+            })
+            .collect(),
+        thoughts: (0..MAX_LIST_ENTRIES).map(thought).collect(),
+        webring: Webring {
+            previous: url(2),
+            home: url(3),
+            next: url(4),
+        },
+    };
+    Portfolio::new(data).expect("adversarial content is valid")
+}
+
+/// Walks terminal output, allowing only the sequences the renderer writes: CSI (cursor moves,
+/// SGR), DECSC/DECRC, and OSC 8 with printable URIs that open and close in pairs.
+/// Returns how many links it saw.
+fn assert_well_formed_escapes(out: &str) -> usize {
+    let mut links = 0;
+    let mut rest = out;
+    let mut open = false;
+    while let Some(start) = rest.find(char::is_control) {
+        let tail = &rest[start..];
+        rest = if let Some(osc) = tail.strip_prefix("\x1b]8;;") {
+            let end = osc.find("\x1b\\").expect("unterminated OSC 8");
+            let uri = &osc[..end];
+            assert!(
+                uri.bytes().all(|byte| (0x21..=0x7e).contains(&byte)),
+                "{uri:?}"
+            );
+            assert_eq!(open, uri.is_empty(), "unbalanced OSC 8 at {uri:?}");
+            open = !uri.is_empty();
+            links += usize::from(open);
+            &osc[end + 2..]
+        } else if let Some(csi) = tail.strip_prefix("\x1b[") {
+            let end = csi
+                .find(|ch: char| ('\x40'..='\x7e').contains(&ch))
+                .expect("unterminated CSI");
+            let params = &csi[..end];
+            assert!(
+                params
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == ';' || ch == ':')
+            );
+            &csi[end + 1..]
+        } else if let Some(after) = tail.strip_prefix("\x1b7").or(tail.strip_prefix("\x1b8")) {
+            after
+        } else {
+            let shown: String = tail.chars().take(12).collect();
+            panic!("raw control character in output: {shown:?}");
+        };
+    }
+    assert!(!open, "OSC 8 left open");
+    links
+}
+
+#[test]
+fn adversarial_content_at_odd_sizes_never_panics_or_leaks_control_bytes() {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    let content = adversarial_content();
+    let mut rng = StdRng::seed_from_u64(0xbad_c0de);
+    let (mut links, mut copies) = (0, 0);
+    let base64_alphabet = |ch: char| ch.is_ascii_alphanumeric() || "+/=".contains(ch);
+    const STEPS: usize = 40;
+    for (cols, rows) in [(0, 0), (1, 1), (1000, 40), (40, 400)] {
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        for step in 0..STEPS {
+            let code = FUZZ_KEYS[rng.random_range(0..FUZZ_KEYS.len())];
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            app.quit = false;
+            let frame = terminal
+                .draw(|frame| draw(frame, &mut app, &content))
+                .unwrap();
+            let context = format!("{cols}x{rows} step {step} after {code:?}");
+            assert!(
+                frame
+                    .buffer
+                    .content
+                    .iter()
+                    .all(|cell| !cell.symbol().contains(char::is_control)),
+                "{context}: control character in a cell"
+            );
+            assert!(app.scroll <= app.max_scroll, "{context}");
+            links += assert_well_formed_escapes(&link_escapes(&app));
+            let clipboard = clipboard_escape(&mut app);
+            if !clipboard.is_empty() {
+                let payload = clipboard
+                    .strip_prefix("\x1b]52;c;")
+                    .and_then(|rest| rest.strip_suffix('\x07'))
+                    .unwrap_or_else(|| panic!("{context}: {clipboard:?}"));
+                assert!(payload.chars().all(base64_alphabet), "{context}");
+                copies += 1;
+            }
+        }
+    }
+    // The walk must actually reach linked and copied states for the checks to mean anything.
+    assert!(links > 0 && copies > 0, "links {links}, copies {copies}");
 }
 
 #[test]
