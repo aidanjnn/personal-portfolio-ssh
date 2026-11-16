@@ -42,9 +42,12 @@ jobs:
     name: Resolve tag
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      packages: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      exists: ${{ steps.existing.outputs.exists }}
+      digest: ${{ steps.existing.outputs.digest }}
     steps:
       - name: Refuse anything but a v* tag
         id: tag
@@ -62,27 +65,66 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A tag that already has an image (a rollback or a redeploy) is never
+      # rebuilt: a rebuild would produce different bytes under the same tag.
+      - name: Look for an existing image
+        id: existing
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+        run: |
+          if out=$(docker buildx imagetools inspect "$REF" 2>&1); then
+            digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$out")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not read the digest of $REF"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            echo "$REF exists as $digest: reusing it, no build"
+            { echo "exists=true"; echo "digest=$digest"; } >> "$GITHUB_OUTPUT"
+          elif grep -Eqi 'not found|manifest unknown|name unknown' <<<"$out"; then
+            echo "$REF does not exist yet: testing and building it"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            # Anything else (auth, network) must not fall through to a rebuild.
+            echo "::error::Could not check $REF"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
   # fmt, clippy, cargo test and the SSH smoke suite (ci.yml, at this tag) must
-  # pass before an image is pushed.
+  # pass before an image is pushed. Skipped when the image already exists.
   test:
     name: Test
     needs: resolve
+    if: needs.resolve.outputs.exists == 'false'
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
-  build:
-    name: Build and push image
+  image:
+    name: Build or reuse image
     needs: [resolve, test]
+    # Runs after a passing test job, or with no test job when the image exists.
+    if: >-
+      !cancelled() && needs.resolve.result == 'success' &&
+      (needs.test.result == 'success' ||
+       (needs.test.result == 'skipped' && needs.resolve.outputs.exists == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       packages: write
     outputs:
-      tag: ${{ needs.resolve.outputs.tag }}
+      digest: ${{ steps.digest.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.resolve.outputs.exists == 'false'
         with:
           persist-credentials: false
 
@@ -94,7 +136,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Point :latest at the existing image
+        if: needs.resolve.outputs.exists == 'true'
+        env:
+          DIGEST: ${{ needs.resolve.outputs.digest }}
+        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+
+      - name: Build and push
+        id: build
+        if: needs.resolve.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64
@@ -108,10 +159,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The VM pulls by digest, never by the mutable tag.
+      - name: Image digest
+        id: digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest || needs.resolve.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No image digest (got '$DIGEST')"
+            exit 1
+          fi
+          echo "$IMAGE@$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
   deploy:
     name: Deploy to VM
-    needs: build
-    if: vars.DEPLOY_ENABLED == 'true'
+    needs: [resolve, image]
+    if: >-
+      !cancelled() && needs.image.result == 'success' &&
+      vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions: {}
@@ -121,7 +187,8 @@ jobs:
       name: production
       url: https://aidanjeon.com
     env:
-      TAG: ${{ needs.build.outputs.tag }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      DIGEST: ${{ needs.image.outputs.digest }}
       DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
       DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
       PUBLIC_HOST: ${{ vars.PUBLIC_HOST || 'ssh.aidanjeon.com' }}
@@ -145,9 +212,15 @@ jobs:
           # ends, so there is no client key, and accept-new only records the
           # node's host key. If Tailscale SSH were off, this would reach the
           # portfolio instead, which rejects exec, so the step fails safely.
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No image digest from the image job"
+            exit 1
+          fi
+          IMAGE_REF="$IMAGE@$DIGEST"
+          echo "Deploying $TAG as $IMAGE_REF"
           ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "cd /opt/portfolio && TAG=${TAG} docker compose -f compose.prod.yaml pull && TAG=${TAG} docker compose -f compose.prod.yaml up -d"
+            "cd /opt/portfolio && export PORTFOLIO_IMAGE=${IMAGE_REF} && docker compose -f compose.prod.yaml pull portfolio && docker compose -f compose.prod.yaml up -d portfolio"
 
       - name: Smoke test public SSH
         run: |

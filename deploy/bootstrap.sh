@@ -17,7 +17,8 @@
 #                Either is needed only until the VM has joined the tailnet.
 #   TS_HOSTNAME  Tailnet name (default portfolio).
 #   TS_TAGS      Tags to advertise (default tag:portfolio).
-#   TAG          Image tag (default: the tag already running, else latest).
+#   TAG          Image tag (default: the release already installed, kept by
+#                digest when CI deployed it; else latest).
 #   START_STACK  1 (default) starts the stack. 0 installs everything but
 #                leaves it stopped, e.g. to restore a host key backup first.
 #
@@ -337,23 +338,32 @@ install_file 0755 "${SCRIPT_DIR}/fingerprint.sh" "${APP_DIR}/fingerprint.sh"
 compose config --quiet
 
 # --- Start ---------------------------------------------------------------------
-# A re-run keeps the release that is already running unless TAG says otherwise.
+# A re-run keeps the release that is already there unless TAG says otherwise.
+# CI deploys by digest, so the current release is a full image reference
+# (...@sha256:...), passed on to compose as PORTFOLIO_IMAGE.
 
-running_tag() {
+current_image() {
   local id
   # -a: a stopped container still records the release to keep.
   id=$(compose ps -a -q portfolio 2>/dev/null || true)
   [[ -n ${id} ]] || return 0
-  docker inspect -f '{{.Config.Image}}' "${id}" | sed -n 's|^.*:\([^:/]*\)$|\1|p'
+  docker inspect -f '{{.Config.Image}}' "${id}"
 }
-TAG=${TAG:-$(running_tag)}
-TAG=${TAG:-latest}
-[[ ${TAG} =~ ^[0-9A-Za-z._-]+$ ]] || die "invalid TAG"
-export TAG
+if [[ -n ${TAG:-} ]]; then
+  [[ ${TAG} =~ ^[0-9A-Za-z._-]+$ ]] || die "invalid TAG"
+  PORTFOLIO_IMAGE=${IMAGE}:${TAG}
+else
+  PORTFOLIO_IMAGE=$(current_image)
+  PORTFOLIO_IMAGE=${PORTFOLIO_IMAGE:-${IMAGE}:latest}
+fi
+ref=${PORTFOLIO_IMAGE#"${IMAGE}"}
+[[ ${ref} =~ ^(:[0-9A-Za-z._-]+|@sha256:[0-9a-f]{64})$ ]] || die "unexpected image ${PORTFOLIO_IMAGE}"
+export PORTFOLIO_IMAGE
+unset TAG
 
 fingerprint="(stack not started)"
 if [[ ${START_STACK} == 1 ]]; then
-  log "Starting ${IMAGE}:${TAG}"
+  log "Starting ${PORTFOLIO_IMAGE}"
   compose pull --quiet
   # --wait returns once portfolio is healthy (its SSH health check) and caddy runs.
   compose up -d --remove-orphans --wait --wait-timeout 180
@@ -373,7 +383,7 @@ fi
 log "Summary"
 echo "tailnet:     ${TS_HOSTNAME} ${TS_IP} (Tailscale SSH)"
 echo "openssh:     $(systemctl is-enabled ssh.socket 2>/dev/null || true)"
-echo "image:       ${IMAGE}:${TAG}"
+echo "image:       ${PORTFOLIO_IMAGE}"
 echo "fingerprint: ${fingerprint}"
-echo "versions:    $(docker --version | cut -d, -f1); tailscale $(tailscale version | head -n 1)"
+echo "versions:    $(docker --version | cut -d, -f1); tailscale ${ts_version}"
 echo "BOOTSTRAP_OK stack=${stack}"

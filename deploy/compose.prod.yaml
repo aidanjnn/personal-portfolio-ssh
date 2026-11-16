@@ -2,10 +2,11 @@
 # deploy/bootstrap.sh installs it and starts it.
 #
 #   cd /opt/portfolio
-#   TAG=v0.1.0 docker compose -f compose.prod.yaml pull
-#   TAG=v0.1.0 docker compose -f compose.prod.yaml up -d
+#   TAG=v0.1.0 docker compose -f compose.prod.yaml pull portfolio
+#   TAG=v0.1.0 docker compose -f compose.prod.yaml up -d --wait portfolio
 #
-# Without TAG, compose falls back to :latest.
+# PORTFOLIO_IMAGE (a full reference, e.g. ...@sha256:...) wins over TAG.
+# With neither, compose falls back to :latest.
 # NEVER run `docker compose down -v`: it deletes the SSH host key volume.
 
 # A fixed project name keeps volume names stable (portfolio_host-key, ...)
@@ -29,7 +30,9 @@ x-hardening: &hardening
 services:
   portfolio:
     <<: *hardening
-    image: ghcr.io/aidanjnn/personal-portfolio-ssh:${TAG:-latest}
+    # PORTFOLIO_IMAGE is a full reference; CI and bootstrap pass a digest
+    # (ghcr.io/...@sha256:...). By hand, TAG=<tag> is enough.
+    image: ${PORTFOLIO_IMAGE:-ghcr.io/aidanjnn/personal-portfolio-ssh:${TAG:-latest}}
     # The Dockerfile's USER, stated here too so no image can run as root.
     user: "10001:10001"
     command:

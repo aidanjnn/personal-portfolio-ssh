@@ -370,12 +370,13 @@ ssh root@portfolio 'docker compose -f /opt/portfolio/compose.prod.yaml run --rm 
 | Action | How |
 | --- | --- |
 | Release | With CI green on `main`: `git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0` |
-| What CI does | Runs `ci.yml` at the tag (fmt, clippy, `cargo test`, the SSH smoke suite). Only if that passes, builds linux/amd64 and pushes `:v0.1.0` and `:latest`. If `DEPLOY_ENABLED` is `true`, joins the tailnet as `tag:ci`, then over Tailscale SSH as `deploy` runs `cd /opt/portfolio && TAG=v0.1.0 docker compose -f compose.prod.yaml pull && ... up -d`. Then `ssh-keyscan` on `PUBLIC_HOST` ports 2222 and 22 must return an ed25519 key (and the expected fingerprint, if set) |
-| Redeploy a tag | Actions → Deploy → Run workflow → "Use workflow from" → Tags → the tag. This also moves `:latest` to it. Any branch is refused |
-| Manual deploy | `ssh root@portfolio` then `cd /opt/portfolio && TAG=<tag> docker compose -f compose.prod.yaml pull && TAG=<tag> docker compose -f compose.prod.yaml up -d` |
-| Change `deploy/` files | Re-run `deploy/azure.sh`. It keeps the running tag |
-| Rollback | `TAG=<previous> docker compose -f compose.prod.yaml up -d` (the old image is usually still local; `pull` first if not). Then reconnect and compare the fingerprint |
-| After a rollback | Re-run the workflow for `<previous>` so `:latest` stops pointing at the bad release. A plain `up -d` without `TAG` uses `:latest` |
+| What CI does | If `ghcr.io/aidanjnn/personal-portfolio-ssh:<tag>` doesn't exist yet: runs `ci.yml` at the tag (fmt, clippy, `cargo test`, the SSH smoke suite) and, only if that passes, builds linux/amd64 and pushes `:<tag>` and `:latest`. If it already exists: no tests, no build; `docker buildx imagetools create` points `:latest` at it. Either way the image's **digest** is what gets deployed. If `DEPLOY_ENABLED` is `true`, joins the tailnet as `tag:ci` and, over Tailscale SSH as `deploy`, pulls and starts `ghcr.io/...@sha256:<digest>`. Then `ssh-keyscan` on `PUBLIC_HOST` ports 2222 and 22 must return an ed25519 key (and the expected fingerprint, if set) |
+| Redeploy a tag | Actions → Deploy → Run workflow → "Use workflow from" → Tags → the tag. Any branch is refused. The run uses the workflow file as it was at that tag |
+| Rollback | The same, with the previous tag. Its image already exists, so nothing is rebuilt: `:latest` moves back to it and the VM runs its digest. Then reconnect and compare the fingerprint |
+| Manual deploy or rollback | `ssh root@portfolio` then `cd /opt/portfolio && TAG=<tag> docker compose -f compose.prod.yaml pull portfolio && TAG=<tag> docker compose -f compose.prod.yaml up -d --wait portfolio`. `PORTFOLIO_IMAGE=ghcr.io/aidanjnn/personal-portfolio-ssh@sha256:<digest>` instead of `TAG` pins the exact image |
+| Change `deploy/` files | Re-run `deploy/azure.sh`. It keeps the current release, by digest if CI deployed it |
+
+The VM runs whatever reference it was last started with. A later `docker compose up -d` without `PORTFOLIO_IMAGE` or `TAG` falls back to `:latest`, which CI keeps pointing at the last deployed tag.
 
 Rollback never touches volumes. Keep at least the previous image: don't `docker image prune -a` right after a release.
 
