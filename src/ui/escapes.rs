@@ -61,10 +61,23 @@ fn sgr(style: Style) -> String {
     out
 }
 
+/// Printable ASCII only. Content validation already guarantees this; the filter keeps a
+/// stray ESC, BEL or C1 byte from ending the OSC 8 sequence early if that ever regresses.
+fn osc_safe(url: &str) -> String {
+    url.bytes()
+        .filter(|byte| (0x21..=0x7e).contains(byte))
+        .map(char::from)
+        .collect()
+}
+
 /// OSC 8 overlays for the visible hyperlinks.
 pub fn link_escapes(app: &App) -> String {
     let mut out = String::new();
     for link in &app.hyperlinks {
+        let url = osc_safe(&link.url);
+        if url.is_empty() {
+            continue;
+        }
         let _ = write!(out, "\x1b7\x1b[{};{}H", link.y + 1, link.x + 1);
         let mut current = None;
         let mut opened = false;
@@ -79,7 +92,7 @@ pub fn link_escapes(app: &App) -> String {
                 current = Some(*style);
             }
             if !opened {
-                let _ = write!(out, "\x1b]8;;{}\x1b\\", link.url);
+                let _ = write!(out, "\x1b]8;;{url}\x1b\\");
                 opened = true;
             }
             out.push_str(symbol);
@@ -141,6 +154,35 @@ mod tests {
         ));
         assert!(escapes.ends_with("\x1b]8;;\x1b\\\x1b[0m\x1b8"));
         assert!(!escapes.contains("\x1b]52;"));
+    }
+
+    #[test]
+    fn link_escapes_drop_url_bytes_that_could_end_the_sequence() {
+        let cells = vec![("x".to_string(), Style::default())];
+        let mut app = App::default();
+        for url in [
+            "https://a.b/\x1b\\\x1b]52;c;bad\x07",
+            "https://a.b/\u{9c}ok \t\n\x7f",
+        ] {
+            app.hyperlinks = vec![crate::app::Hyperlink {
+                x: 0,
+                y: 0,
+                cells: cells.clone(),
+                url: url.into(),
+            }];
+            let escapes = link_escapes(&app);
+            let uri = &escapes[escapes.find("\x1b]8;;").unwrap() + 5..];
+            let uri = &uri[..uri.find("\x1b\\").unwrap()];
+            assert!(
+                uri.bytes().all(|byte| (0x21..=0x7e).contains(&byte)),
+                "{uri:?}"
+            );
+            // The printable leftovers stay inside the URI; no new sequence can start.
+            assert!(!escapes.contains('\x07') && !escapes.contains("\x1b]52;"));
+        }
+        // Nothing printable left: no link at all, rather than an empty (closing) OSC 8.
+        app.hyperlinks[0].url = "\x1b\x07 ".into();
+        assert_eq!(link_escapes(&app), "");
     }
 
     #[test]
