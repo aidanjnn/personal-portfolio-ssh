@@ -1030,7 +1030,7 @@ fn draw_too_small(buf: &mut Buffer, area: Rect, pal: &Palette) {
 }
 
 /// Lays out the current page for `area` and brings the app's layout facts, focus, scroll,
-/// sheet and pending copy up to date.
+/// sheet and pending copy up to date. Shared by `draw` and `relayout` so both behave the same.
 /// Returns `None` when the terminal is too small to show the page.
 fn settle<'a>(
     app: &mut App,
@@ -1109,6 +1109,13 @@ fn settle<'a>(
         }
     }
     Some((layout, doc))
+}
+
+/// Applies a key's layout consequences (focus, scroll bounds) without rendering, so the
+/// next key resolves exactly as it would after a full `draw` at `cols`×`rows`.
+pub fn relayout(app: &mut App, content: &Portfolio, cols: u16, rows: u16) {
+    let pal = Palette::of(app.theme);
+    settle(app, content, Rect::new(0, 0, cols, rows), &pal);
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App, content: &Portfolio) {

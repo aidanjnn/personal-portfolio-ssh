@@ -795,6 +795,63 @@ fn every_page_renders_at_every_size() {
     assert_eq!(rows[4].trim(), "Resize to at least 32×10");
 }
 
+#[test]
+fn relayout_between_keys_matches_drawing_after_each_key() {
+    use KeyCode::*;
+    let content = content();
+    let mut sequences = every_state();
+    sequences.extend([
+        vec![Char('p'), Tab, Tab, Tab, End, Char('k'), Char('k')],
+        vec![
+            Char('w'),
+            Enter,
+            Down,
+            Enter,
+            Down,
+            Enter,
+            PageDown,
+            Char('g'),
+        ],
+        vec![Char('t'), Enter, PageDown, PageDown, Tab, Char('c'), Esc],
+        vec![
+            Char('j'),
+            Char('j'),
+            Char('j'),
+            Char('j'),
+            Char('j'),
+            Char('j'),
+        ],
+    ]);
+    for keys in sequences {
+        for (cols, rows) in [(100, 30), (80, 24), (40, 16), (32, 10), (20, 5)] {
+            let (drawn, expected) = scenario(&keys, cols, rows);
+            let mut app = App::default();
+            render(&mut app, &content, cols, rows);
+            for (index, &code) in keys.iter().enumerate() {
+                key(&mut app, code);
+                if index + 1 < keys.len() {
+                    relayout(&mut app, &content, cols, rows);
+                }
+            }
+            let buffer = render(&mut app, &content, cols, rows);
+            let name = format!("{keys:?} at {cols}x{rows}");
+            assert_eq!(dump(&buffer), dump(&expected), "{name}");
+            assert_eq!(
+                (app.page, app.focus, app.scroll, app.max_scroll, app.sheet),
+                (
+                    drawn.page,
+                    drawn.focus,
+                    drawn.scroll,
+                    drawn.max_scroll,
+                    drawn.sheet
+                ),
+                "{name}"
+            );
+            assert_eq!(app.clipboard, drawn.clipboard, "{name}");
+        }
+    }
+}
+
 /// Every bound key, plus one unbound key.
 const FUZZ_KEYS: [KeyCode; 26] = [
     KeyCode::Char('h'),

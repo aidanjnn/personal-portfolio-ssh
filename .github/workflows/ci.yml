@@ -21,3 +21,5 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked
+      - run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+      - run: python3 -B scripts/smoke.py --ssh
