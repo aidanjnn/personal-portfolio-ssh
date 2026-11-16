@@ -231,10 +231,12 @@ mod tests {
             "file:///etc/passwd",
             "",
         ] {
-            assert!(
-                parse_server_args(&["--content-url".into(), url.into()]).is_err(),
-                "accepted {url:?}"
-            );
+            let error = parse_server_args(&["--content-url".into(), url.into()])
+                .err()
+                .unwrap_or_else(|| panic!("accepted {url:?}"))
+                .to_string();
+            assert!(error.contains("--content-url"), "{error}");
+            assert!(!error.contains("mailto"), "{error}");
         }
     }
 
