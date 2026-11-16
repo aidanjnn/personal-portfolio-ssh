@@ -51,7 +51,7 @@ x64, not Arm: the image is built for linux/amd64 only.
 
 **Real source addresses.** Both limits count by the visitor's IP, which only works while it survives Docker's DNAT into the container. `bootstrap.sh` pins this in `/etc/docker/daemon.json`: `"iptables": true` (DNAT keeps the source; with it off, docker-proxy would accept every connection and the container would see the bridge gateway for everyone, so all visitors would share 3 slots), `"userland-proxy": true` (only host-local connections go through docker-proxy), `"live-restore": true` (dockerd restarts don't stop containers), and log defaults. Docker restarts only when the file changes. Visitors behind one shared NAT, such as a campus, office or carrier-grade NAT, really do share one address, so they share 3 sessions and one rate bucket.
 
-**Admin access.** Only Tailscale SSH, on the tailnet address. OpenSSH is disabled and masked, and no NSG rule ever admits admin SSH. The VM's admin account (`azureuser`) holds your public key only because Azure requires one. Break-glass is `az vm run-command` and the serial console ([below](#break-glass)).
+**Admin access.** Only Tailscale SSH, on the tailnet address. OpenSSH is disabled and masked, and no NSG rule ever admits admin SSH. The VM's admin account (`azureuser`) holds your public key only because Azure requires one. Break-glass is `az vm run-command`, the serial console, and `az vm repair` when the VM agent itself is down ([below](#break-glass)).
 
 ## Cost
 
@@ -183,6 +183,7 @@ The first command must reach the host shell over Tailscale (not the portfolio), 
 
 To keep the published fingerprint on a new VM, restore the key before the stack ever starts:
 
+0. Delete the old VM (or `az group delete -n portfolio` for a clean slate), then **remove the old `portfolio` machine from the tailnet** (Tailscale admin console → Machines → `portfolio` → Remove). Otherwise the new VM joins as `portfolio-1`, and `ssh root@portfolio`, `DEPLOY_HOST` and the tailnet policy's expectations all point at the dead node.
 1. Read a fresh auth key as in [Provision](#provision) step 4, then `TS_AUTHKEY=$TS_AUTHKEY deploy/azure.sh --no-start`. Bootstrap installs everything but leaves the stack stopped and the NSG closed.
 2. Restore the key ([below](#host-key-backup-and-restore)).
 3. `deploy/azure.sh` again. It starts the stack and opens the NSG. Check that `fingerprint.sh` prints the published value.
@@ -202,7 +203,9 @@ To keep the published fingerprint on a new VM, restore the key before the stack 
 
 ## Break-glass
 
-**Run Command** works without SSH or Tailscale. It runs as root through the Azure VM agent, takes about 20 seconds at minimum and returns the last 4 KB of output:
+Three ways in without Tailscale, in this order. None needs OpenSSH, so it stays masked.
+
+**1. Run Command** (first resort). It runs a script as root through the Azure VM agent (`walinuxagent`), takes about 20 seconds at minimum and returns the last 4 KB of output:
 
 ```sh
 az vm run-command invoke -g portfolio -n portfolio --command-id RunShellScript \
@@ -210,15 +213,50 @@ az vm run-command invoke -g portfolio -n portfolio --command-id RunShellScript \
   --query 'value[0].message' -o tsv
 ```
 
-If the VM drops off the tailnet (node removed, state lost), generate a new auth key and re-run `azure.sh`. Bootstrap rejoins when Tailscale is not running.
+If the VM drops off the tailnet (node removed, state lost), delete any leftover `portfolio` node in the Tailscale admin console, generate a new auth key and re-run `azure.sh`. Bootstrap rejoins when Tailscale is not running.
 
-**Serial console** is for when the agent or networking is broken. It needs boot diagnostics (`azure.sh` enables it) and a password, which the VM does not have:
+**2. Serial console**, for an interactive shell while the agent still works but networking or Tailscale doesn't. It needs boot diagnostics (`azure.sh` enables it) and a password, which the VM does not have. `az vm user update` sets one through the VMAccess extension, which needs the same agent as Run Command, so this is no help once the agent is down:
 
 1. Set a temporary one: `az vm user update -g portfolio -n portfolio -u azureuser -p '<temporary>'`.
 2. Portal → `portfolio` VM → Help → Serial console. Log in as `azureuser`, then `sudo -i`.
 3. Afterwards, lock it again: run `passwd -l azureuser` through Run Command.
 
-Neither path needs OpenSSH, so it stays masked.
+**3. Repair VM**, when the agent itself is broken (Run Command times out or the VM agent shows "Not Ready"). `az vm repair` doesn't use the VM's agent at all: it copies the OS disk, attaches the copy to a new rescue VM, lets you fix it there, then swaps the fixed copy in as the OS disk. It needs the `vm-repair` CLI extension:
+
+```sh
+az extension add --name vm-repair        # once; later: az extension update --name vm-repair
+
+# Rescue VM in its own resource group, with a copy of the OS disk attached as a data disk.
+# No public IP. The password is for the rescue VM only, which restore deletes.
+printf 'Rescue VM password: '; read -rs REPAIR_PW; echo
+az vm repair create -g portfolio -n portfolio \
+  --repair-username repairadmin --repair-password "$REPAIR_PW" --verbose
+unset REPAIR_PW
+
+# Fix the copy: runs fix.sh (below) as root on the rescue VM through its own, healthy agent.
+az vm repair run -g portfolio -n portfolio --run-on-repair \
+  --custom-script-file fix.sh --verbose
+
+# Swap the fixed copy in as the OS disk, restart the VM and delete the rescue resources.
+az vm repair restore -g portfolio -n portfolio --verbose
+```
+
+`fix.sh`, adapted to what is broken:
+
+```bash
+#!/bin/bash
+set -euxo pipefail
+# The copied disk's root filesystem: labelled cloudimg-rootfs and not mounted.
+root=$(lsblk -nrpo NAME,LABEL,MOUNTPOINT | awk '$2 == "cloudimg-rootfs" && NF == 2 {print $1}')
+mkdir -p /rescue && mount "$root" /rescue
+chroot /rescue systemctl enable walinuxagent.service   # bring the agent (and Run Command) back
+chroot /rescue systemctl enable tailscaled.service docker.service
+# Optional, for the serial console: a temporary password. Lock it again afterwards.
+# echo 'azureuser:<temporary>' | chroot /rescue chpasswd
+umount /rescue
+```
+
+For boot failures (bad `fstab`, initrd, kernel), the built-in Linux auto-repair scripts do the work instead: `az vm repair run -g portfolio -n portfolio --run-on-repair --run-id linux-alar2 --parameters fstab` (or `initrd`, `kernel`). After `restore`, the VM boots from the fixed copy with the same tailnet identity and host-key volume. The original OS disk stays behind unattached: once the VM is healthy, delete it with `az disk delete -g portfolio -n portfolio-osdisk` (check the name with `az disk list -g portfolio -o table`), since a third P6 disk is not free. The rescue VM costs a few cents per hour while it exists.
 
 ## DNS cutover
 
@@ -336,7 +374,7 @@ After any manual upgrade or reboot, check the fingerprint.
 | A port published by mistake | The NSG admits only TCP 22, 2222, 80 and 443, whatever compose publishes |
 | Upgrades restart dockerd or reboot the VM | `live-restore` keeps containers up through a dockerd restart (bootstrap re-runs and manual upgrades upgrade docker-ce). Reboots happen only when an update requires one, at 04:00 Pacific, and everything starts on boot |
 | IPv6 | Not offered: IPv4 VNet and IP, no AAAA. Adding it needs a dual-stack VNet and IP, and a check that the container sees real IPv6 peers, since Docker's default bridge shows them all as the gateway and `--max-per-ip` would count them together |
-| Tailscale down or misconfigured | Run Command or the serial console ([Break-glass](#break-glass)) |
+| Tailscale down or misconfigured | Run Command or the serial console; `az vm repair` if the VM agent is down too ([Break-glass](#break-glass)) |
 | Auth key copy on the VM | The run-command script stays in a root-only agent directory. The key is one-off, tagged, and expires in a day |
 | 1 GiB RAM, burstable CPU | Swap file; containers capped at 256 + 128 MiB and 0.5 CPU each. Watch CPU credits |
 | ACME fails at cutover | Restart Caddy after each record resolves. Mind Let's Encrypt's failed-validation limit; don't restart in a loop |
