@@ -1,8 +1,12 @@
 name: Rust
 
 on:
+  # Branches only: a v* tag runs these same checks through deploy.yml, which
+  # calls this workflow and pushes an image only if they pass.
   push:
+    branches: ["**"]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,6 +16,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -63,7 +63,7 @@ cargo test --locked
 cargo build --locked && python3 scripts/smoke.py --ssh
 ```
 
-CI runs all four on every push and pull request. The plan and status live in [PLAN.md](PLAN.md); the design in [docs/MOCKUPS.md](docs/MOCKUPS.md).
+CI runs all four on every branch push and pull request, and again on every `v*` tag, where they must pass before the deploy workflow builds an image. The plan and status live in [PLAN.md](PLAN.md); the design in [docs/MOCKUPS.md](docs/MOCKUPS.md).
 
 ## Credits
 

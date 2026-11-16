@@ -62,9 +62,18 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+  # fmt, clippy, cargo test and the SSH smoke suite (ci.yml, at this tag) must
+  # pass before an image is pushed.
+  test:
+    name: Test
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
     name: Build and push image
-    needs: resolve
+    needs: [resolve, test]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
