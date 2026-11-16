@@ -752,9 +752,11 @@ def check_ssh(binary, output, port, slow=False):
 
             text = server_log()
             assert "session connect" in text and "session disconnect" in text, "session lifecycle not logged"
+            assert "summary: refused 1 connections (rate 0, per-address 1, capacity 0)" in text, \
+                "per-address refusal missing from the summaries"
             leaks = log_leaks(text)
             assert not leaks, f"server log names a client address or user: {leaks!r}"
-            checks.ok("log has session connect/disconnect and no client address or username")
+            checks.ok("log has session connect/disconnect, refusal summaries, and no client address or username")
         finally:
             for terminal in sessions:
                 terminal.close()

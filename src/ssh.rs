@@ -128,8 +128,9 @@ async fn run_server(
         config.max_per_ip
     );
     let content = Arc::new(content);
-    let per_ip = IpLimiter::new(config.max_per_ip);
-    let permits = Arc::new(Semaphore::new(config.max_sessions));
+    let mut gate = Gate::new(config.max_per_ip, config.max_sessions, Instant::now());
+    let log = Arc::new(Log::new(Instant::now()));
+    let mut summaries = tokio::time::interval(SUMMARY_INTERVAL);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
     tokio::pin!(stop);
@@ -145,15 +146,17 @@ async fn run_server(
                         continue;
                     }
                 };
-                // Checked first so one address cannot spend global permits.
-                let Some(address_slot) = per_ip.try_acquire(peer.ip()) else { continue; };
-                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { continue; };
+                let admission = match gate.admit(peer.ip(), Instant::now()) {
+                    Ok(admission) => admission,
+                    Err(refusal) => {
+                        log.refused(refusal);
+                        continue;
+                    }
+                };
                 let Ok((stream, kill)) = killable(stream) else { continue; };
                 let _ = stream.set_nodelay(true);
-                eprintln!(
-                    "session connect (active {})",
-                    config.max_sessions - permits.available_permits()
-                );
+                let active = config.max_sessions - gate.permits.available_permits();
+                log.line(|| format!("session connect (active {active})"));
                 let started = Instant::now();
                 let deadline = started + config.max_session;
                 let record = Arc::new(Mutex::new(SessionRecord::default()));
@@ -169,7 +172,7 @@ async fn run_server(
                     config.links,
                     Arc::clone(&record),
                     stage,
-                    Admission { _slot: address_slot, _permit: permit },
+                    admission,
                 );
                 let connection = Connection {
                     kill,
@@ -180,18 +183,23 @@ async fn run_server(
                     record: Arc::clone(&record),
                 };
                 let ssh_config = Arc::clone(&ssh_config);
+                let log = Arc::clone(&log);
                 connections.spawn(async move {
                     connection.run(ssh_config, stream, handler).await;
                     let record = record.lock().unwrap_or_else(PoisonError::into_inner);
-                    eprintln!(
+                    log.line(|| format!(
                         "session disconnect (duration {}s, size {}, reason {})",
                         started.elapsed().as_secs(),
                         record.size.map_or("none".into(), |size| format!("{}x{}", size.width, size.height)),
                         record.reason.unwrap_or(Reason::Closed).as_str(),
-                    );
+                    ));
                 });
             }
             _ = connections.join_next(), if !connections.is_empty() => {}
+            _ = summaries.tick() => {
+                log.summarize();
+                gate.rate.prune(Instant::now());
+            }
             () = &mut stop => break,
         }
     }
@@ -199,6 +207,7 @@ async fn run_server(
     let _ = shutdown.send(true);
     // Every connection ends within a bounded time (Connection::run), so this cannot hang.
     while connections.join_next().await.is_some() {}
+    log.summarize();
     Ok(())
 }
 
@@ -404,11 +413,10 @@ impl IpLimiter {
     }
 
     fn try_acquire(&self, ip: IpAddr) -> Option<IpSlot> {
-        let length = if ip.to_canonical().is_ipv4() { 32 } else { 64 };
-        let mut limits = vec![((bucket(ip), length), self.max)];
-        if let Some(network) = network(ip) {
-            limits.push(((network, 56), self.max * NETWORK_FACTOR));
-        }
+        let limits: Vec<_> = prefixes(ip)
+            .into_iter()
+            .map(|(prefix, share)| (prefix, self.max * share))
+            .collect();
         let mut counts = self.counts();
         if limits
             .iter()
@@ -423,6 +431,196 @@ impl IpLimiter {
         Some(IpSlot {
             limiter: self.clone(),
             prefixes,
+        })
+    }
+}
+
+/// The ranges a peer counts against, each with its share as a multiple of the per-address
+/// limit: its address (IPv4) or /64 (IPv6) at 1, and for IPv6 also its /56.
+fn prefixes(ip: IpAddr) -> Vec<(Prefix, usize)> {
+    let length = if ip.to_canonical().is_ipv4() { 32 } else { 64 };
+    let mut prefixes = vec![((bucket(ip), length), 1)];
+    if let Some(network) = network(ip) {
+        prefixes.push(((network, 56), NETWORK_FACTOR));
+    }
+    prefixes
+}
+
+/// New connections per address: a burst of 20, then 10 a minute. A visit needs one, and a
+/// few reconnects are fine; a handshake flood is not.
+const CONNECTIONS_PER_MINUTE: f64 = 10.0;
+const CONNECTION_BURST: f64 = 20.0;
+/// Most ranges the connection rate remembers. Past it, ranges it does not know are let
+/// through, still under the concurrency limits, rather than locking out new visitors.
+const RATE_TABLE_LIMIT: usize = 16_384;
+
+/// New-connection budgets per address range, keyed like `IpLimiter`, in memory only.
+struct ConnectionRate {
+    buckets: HashMap<Prefix, Bucket>,
+    pruned: Instant,
+}
+
+impl ConnectionRate {
+    fn new(now: Instant) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            pruned: now,
+        }
+    }
+
+    /// Spends one connection from each of the peer's ranges, if all of them have one.
+    fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let prefixes = prefixes(ip);
+        let unknown = prefixes
+            .iter()
+            .filter(|(prefix, _)| !self.buckets.contains_key(prefix))
+            .count();
+        if self.buckets.len() + unknown > RATE_TABLE_LIMIT {
+            if now >= self.pruned + Duration::from_secs(1) {
+                self.prune(now);
+            }
+            if self.buckets.len() + unknown > RATE_TABLE_LIMIT {
+                return true;
+            }
+        }
+        for &(prefix, share) in &prefixes {
+            let share = share as f64;
+            self.buckets
+                .entry(prefix)
+                .or_insert_with(|| {
+                    Bucket::full(
+                        CONNECTIONS_PER_MINUTE / 60.0 * share,
+                        CONNECTION_BURST * share,
+                        now,
+                    )
+                })
+                .refill(now);
+        }
+        if prefixes
+            .iter()
+            .any(|(prefix, _)| self.buckets[prefix].tokens < 1.0)
+        {
+            return false;
+        }
+        for (prefix, _) in &prefixes {
+            if let Some(bucket) = self.buckets.get_mut(prefix) {
+                bucket.tokens -= 1.0;
+            }
+        }
+        true
+    }
+
+    /// Forgets ranges whose budget has refilled: a fresh entry would be identical.
+    fn prune(&mut self, now: Instant) {
+        self.buckets.retain(|_, bucket| {
+            bucket.refill(now);
+            bucket.tokens < bucket.burst
+        });
+        self.pruned = now;
+    }
+}
+
+/// Why a connection was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    Rate,
+    Address,
+    Capacity,
+}
+
+/// Decides whether to serve a new connection.
+struct Gate {
+    rate: ConnectionRate,
+    per_ip: IpLimiter,
+    permits: Arc<Semaphore>,
+}
+
+impl Gate {
+    fn new(max_per_ip: usize, max_sessions: usize, now: Instant) -> Self {
+        Self {
+            rate: ConnectionRate::new(now),
+            per_ip: IpLimiter::new(max_per_ip),
+            permits: Arc::new(Semaphore::new(max_sessions)),
+        }
+    }
+
+    fn admit(&mut self, ip: IpAddr, now: Instant) -> Result<Admission, Refusal> {
+        if !self.rate.allow(ip, now) {
+            return Err(Refusal::Rate);
+        }
+        // Checked before the global permit so one address cannot spend global permits.
+        let slot = self.per_ip.try_acquire(ip).ok_or(Refusal::Address)?;
+        let permit = Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .map_err(|_| Refusal::Capacity)?;
+        Ok(Admission {
+            _slot: slot,
+            _permit: permit,
+        })
+    }
+}
+
+/// Per-connection log lines: a burst of 60, then one a second. Lines past that are only
+/// counted, as refusals always are, and `summarize` reports the counts every
+/// `SUMMARY_INTERVAL`, so a flood costs one line per interval instead of per connection.
+const LOG_LINES_PER_SECOND: f64 = 1.0;
+const LOG_BURST: f64 = 60.0;
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
+
+struct Log(Mutex<LogCounts>);
+
+struct LogCounts {
+    lines: Bucket,
+    suppressed: u64,
+    /// Indexed by `Refusal`.
+    refused: [u64; 3],
+}
+
+impl Log {
+    fn new(now: Instant) -> Self {
+        Self(Mutex::new(LogCounts {
+            lines: Bucket::full(LOG_LINES_PER_SECOND, LOG_BURST, now),
+            suppressed: 0,
+            refused: [0; 3],
+        }))
+    }
+
+    fn counts(&self) -> std::sync::MutexGuard<'_, LogCounts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Prints `line` if the log budget allows, and otherwise counts it.
+    fn line(&self, line: impl FnOnce() -> String) {
+        let mut counts = self.counts();
+        if counts.lines.take(Instant::now(), 1) == 1 {
+            eprintln!("{}", line());
+        } else {
+            counts.suppressed += 1;
+        }
+    }
+
+    fn refused(&self, refusal: Refusal) {
+        self.counts().refused[refusal as usize] += 1;
+    }
+
+    fn summarize(&self) {
+        if let Some(summary) = self.counts().summary() {
+            eprintln!("{summary}");
+        }
+    }
+}
+
+impl LogCounts {
+    /// The counts since the last summary, if there are any, and resets them.
+    fn summary(&mut self) -> Option<String> {
+        let [rate, address, capacity] = std::mem::take(&mut self.refused);
+        let suppressed = std::mem::take(&mut self.suppressed);
+        let refused = rate + address + capacity;
+        (refused > 0 || suppressed > 0).then(|| {
+            format!(
+                "summary: refused {refused} connections (rate {rate}, per-address {address}, \
+                 capacity {capacity}); {suppressed} log lines suppressed"
+            )
         })
     }
 }
@@ -1564,6 +1762,102 @@ mod tests {
         visit.output.clear();
         visit.send(b"w").await;
         visit.read_until(b"Copperlane").await;
+        server.stop().await;
+    }
+
+    #[test]
+    fn new_connections_per_address_are_rate_limited() {
+        let start = Instant::now();
+        let mut rate = ConnectionRate::new(start);
+        let home: IpAddr = "192.0.2.1".parse().unwrap();
+        let allowed = (0..100).filter(|_| rate.allow(home, start)).count();
+        assert_eq!(allowed, CONNECTION_BURST as usize);
+        assert!(
+            rate.allow("192.0.2.2".parse().unwrap(), start),
+            "a neighbour"
+        );
+        // 10 a minute: one more every six seconds.
+        assert!(rate.allow(home, start + Duration::from_secs(6)));
+        assert!(!rate.allow(home, start + Duration::from_secs(7)));
+        // Refilled budgets are forgotten, so the table only holds recent floods.
+        rate.prune(start + Duration::from_secs(60));
+        assert_eq!(
+            rate.buckets.len(),
+            1,
+            "the flooding address is still remembered"
+        );
+        rate.prune(start + Duration::from_secs(600));
+        assert!(rate.buckets.is_empty());
+    }
+
+    #[test]
+    fn ipv6_connection_rate_is_also_shared_per_56() {
+        let start = Instant::now();
+        let mut rate = ConnectionRate::new(start);
+        let v6 = |text: String| text.parse::<IpAddr>().unwrap();
+        let mut allowed = 0;
+        for subnet in 0..=NETWORK_FACTOR {
+            let ip = v6(format!("2001:db8:0:1{subnet:02x}::1"));
+            allowed += (0..100).filter(|_| rate.allow(ip, start)).count();
+        }
+        assert_eq!(allowed, CONNECTION_BURST as usize * NETWORK_FACTOR);
+        assert!(rate.allow(v6("2001:db8:0:200::1".into()), start));
+    }
+
+    #[test]
+    fn a_full_rate_table_lets_unknown_addresses_through() {
+        let start = Instant::now();
+        let mut rate = ConnectionRate::new(start);
+        for i in 0..RATE_TABLE_LIMIT as u32 {
+            assert!(rate.allow(IpAddr::V4((0x0a00_0000 + i).into()), start));
+        }
+        let stranger: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..100 {
+            assert!(rate.allow(stranger, start));
+        }
+        assert_eq!(rate.buckets.len(), RATE_TABLE_LIMIT);
+    }
+
+    #[test]
+    fn a_flood_is_summarised_instead_of_logged_line_by_line() {
+        let start = Instant::now();
+        let log = Log::new(start);
+        let mut counts = log.counts();
+        let printed = (0..1000)
+            .filter(|_| counts.lines.take(start, 1) == 1)
+            .count();
+        assert_eq!(printed, LOG_BURST as usize);
+        counts.suppressed = 1000 - printed as u64;
+        counts.refused = [2020, 21, 0];
+        assert_eq!(
+            counts.summary().unwrap(),
+            "summary: refused 2041 connections (rate 2020, per-address 21, capacity 0); \
+             940 log lines suppressed"
+        );
+        assert_eq!(counts.summary(), None, "counts reset after each summary");
+    }
+
+    #[tokio::test]
+    async fn the_server_refuses_a_connection_flood_from_one_address() {
+        let server = TestServer::start(Config {
+            max_per_ip: 32,
+            ..test_config()
+        })
+        .await;
+        let mut admitted = 0;
+        for _ in 0..30 {
+            let mut stream = TcpStream::connect(server.addr).await.unwrap();
+            let mut first = Vec::new();
+            let _ = timeout(
+                Duration::from_secs(2),
+                tokio::io::AsyncReadExt::read_buf(&mut stream, &mut first),
+            )
+            .await;
+            if first.starts_with(b"SSH-2.0-") {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, CONNECTION_BURST as usize);
         server.stop().await;
     }
 
